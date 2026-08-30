@@ -1,0 +1,17 @@
+# C++ derleme çıktıları
+*.o
+*.obj
+*.exe
+*.out
+
+# CUDA/derleyici geçici dosyaları
+*.ptx
+*.cubin
+
+# IDE / editör
+.vscode/
+.idea/
+
+
+# Log dosyaları
+*.log

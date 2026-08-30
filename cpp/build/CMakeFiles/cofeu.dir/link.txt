@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC -O3 -DNDEBUG -shared -Wl,-soname,libcofeu.so -o libcofeu.so CMakeFiles/cofeu.dir/src/model.cpp.o CMakeFiles/cofeu.dir/src/tokenizer.cpp.o  /usr/lib/gcc/x86_64-linux-gnu/13/libgomp.so /usr/lib/x86_64-linux-gnu/libpthread.a 
