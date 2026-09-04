@@ -2,13 +2,14 @@
 
 Byte-Pair Encoding (BPE) tokenizer. Metni alt-kelime parçalarına böler,
 böylece karakter seviyesine göre daha uzun bağlam ve daha verimli üretim
-sağlar. C++ inference motoruna kolayca taşınabilir olması için basit
+sağlar. C++ inference motoruna kolayca taşınabilmesi için basit
 tutulmuştur.
 
 Vocab formatı (JSON):
   {
-    "merges": ["a b", "ab c", ...],   # BPE birleştirme kuralları (sıralı)
-    "vocab": {"a": 0, "b": 1, ...}    # token -> id
+    "merges": ["a b", "ab c", ...],
+    "vocab": {"<|bos|>": 0, "<|eos|>": 1, ...},
+    "special_tokens": ["<|bos|>", "<|eos|>", "<|pad|>", "<|unk|>"]
   }
 """
 
@@ -17,13 +18,30 @@ from __future__ import annotations
 import json
 from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
+
+
+SPECIAL_TOKENS = {
+    "<|bos|>": 0,
+    "<|eos|>": 1,
+    "<|pad|>": 2,
+    "<|unk|>": 3,
+}
 
 
 class BPETokenizer:
     """Byte-Pair Encoding tokenizer."""
 
-    def __init__(self, merges: List[str] | None = None, vocab: Dict[str, int] | None = None):
+    def __init__(
+        self,
+        merges: Optional[List[str]] = None,
+        vocab: Optional[Dict[str, int]] = None,
+        special_tokens: Optional[List[str]] = None,
+    ):
+        self.special_tokens: List[str] = special_tokens or list(SPECIAL_TOKENS.keys())
+        self.special_ids: Dict[str, int] = {}
+        self.special_id_to_token: Dict[int, str] = {}
+
         self.merges: List[Tuple[str, str]] = []
         if merges:
             for m in merges:
@@ -34,7 +52,27 @@ class BPETokenizer:
         self.stoi: Dict[str, int] = dict(vocab) if vocab else {}
         self.itos: Dict[int, str] = {i: c for c, i in self.stoi.items()}
 
-    # --- Eğitim ---
+        # Special token mapping'lerini güncelle
+        for tok in self.special_tokens:
+            if tok in self.stoi:
+                self.special_ids[tok] = self.stoi[tok]
+                self.special_id_to_token[self.stoi[tok]] = tok
+
+    @property
+    def bos_id(self) -> int:
+        return self.special_ids.get("<|bos|>", -1)
+
+    @property
+    def eos_id(self) -> int:
+        return self.special_ids.get("<|eos|>", -1)
+
+    @property
+    def pad_id(self) -> int:
+        return self.special_ids.get("<|pad|>", -1)
+
+    @property
+    def unk_id(self) -> int:
+        return self.special_ids.get("<|unk|>", -1)
 
     @classmethod
     def build(cls, text: str, vocab_size: int = 512, max_sample: int = 200000) -> "BPETokenizer":
@@ -43,20 +81,15 @@ class BPETokenizer:
         Hız için BPE eğitimini tüm metin yerine bir örneklem üzerinde yapar.
         max_sample: BPE eğitimi için kullanılacak maksimum karakter sayısı.
         """
-        # BPE eğitimi için örneklem al (hız için)
         sample = text[:max_sample]
-
-        # Başlangıç: karakter seviyesi (UTF-8 karakterler)
         chars = sorted(set(sample))
-        vocab = {c: i for i, c in enumerate(chars)}
+        vocab: Dict[str, int] = {}
         merges: List[Tuple[str, str]] = []
 
-        # Metni karakter listesine çevir
         tokens = list(sample)
+        num_merges = vocab_size - len(chars) - len(SPECIAL_TOKENS)
 
-        num_merges = vocab_size - len(chars)
         for _ in range(num_merges):
-            # Bitişik çiftleri say
             pairs = Counter(zip(tokens, tokens[1:]))
             if not pairs:
                 break
@@ -64,12 +97,10 @@ class BPETokenizer:
             if pairs[best_pair] < 2:
                 break
 
-            # Yeni token
             new_token = best_pair[0] + best_pair[1]
             merges.append(best_pair)
-            vocab[new_token] = len(vocab)
+            vocab[new_token] = len(SPECIAL_TOKENS) + len(chars) + len(merges) - 1
 
-            # Metinde birleştir
             new_tokens = []
             i = 0
             while i < len(tokens):
@@ -81,33 +112,40 @@ class BPETokenizer:
                     i += 1
             tokens = new_tokens
 
-        tok = cls(merges=[f"{a} {b}" for a, b in merges], vocab=vocab)
+        # Special token'ları en başa ekle, sonra karakterleri, sonra merge'leri
+        full_vocab: Dict[str, int] = dict(SPECIAL_TOKENS)
+        for i, c in enumerate(chars):
+            full_vocab[c] = len(SPECIAL_TOKENS) + i
+        for i, (a, b) in enumerate(merges):
+            full_vocab[a + b] = len(SPECIAL_TOKENS) + len(chars) + i
+
+        tok = cls(
+            merges=[f"{a} {b}" for a, b in merges],
+            vocab=full_vocab,
+            special_tokens=list(SPECIAL_TOKENS.keys()),
+        )
         return tok
 
-    # --- Encode / Decode ---
+    def _is_special(self, token: str) -> bool:
+        return token in self.special_ids
 
-    def encode(self, text: str) -> List[int]:
+    def encode(self, text: str, add_special_tokens: bool = False) -> List[int]:
         """Metni token id listesine çevirir.
 
-        GPT-2 tarzı tek geçişli BPE: her merge'e bir rank verilir ve
-        tokenizasyon sırasında en düşük rank'lı merge uygulanır. Bu,
-        merge'leri sırayla uygulamakla aynı sonucu verir ama çok daha hızlıdır.
+        add_special_tokens=True ise başa BOS ekler.
         """
-        # Merge rank'ları: (a, b) -> (rank, ab)
-        ranks = {}
+        ranks: Dict[Tuple[str, str], Tuple[int, str]] = {}
         for rank, (a, b) in enumerate(self.merges):
             ranks[(a, b)] = (rank, a + b)
 
         tokens = list(text)
-        result = []
+        result: List[str] = []
         i = 0
         n = len(tokens)
         while i < n:
-            # Bu pozisyondan başlayarak en düşük rank'lı merge'i bul
             best_rank = None
             best_token = None
             best_len = 1
-            # En fazla birkaç adım ileriye bak (merge zincirleri için)
             j = i
             current = tokens[j]
             while j < n - 1:
@@ -130,17 +168,26 @@ class BPETokenizer:
                 result.append(tokens[i])
                 i += 1
 
-        return [self.stoi[t] for t in result if t in self.stoi]
+        ids = [self.stoi.get(t, self.unk_id) for t in result if t in self.stoi or t == "<|unk|>"]
 
-    def decode(self, ids: List[int]) -> str:
+        if add_special_tokens and self.bos_id >= 0:
+            ids = [self.bos_id] + ids
+
+        return ids
+
+    def decode(self, ids: List[int], skip_special_tokens: bool = True) -> str:
         """Token id listesini metne çevirir."""
-        return "".join(self.itos[i] for i in ids if i in self.itos)
+        parts = []
+        for i in ids:
+            if skip_special_tokens and i in self.special_id_to_token:
+                continue
+            if i in self.itos:
+                parts.append(self.itos[i])
+        return "".join(parts)
 
-    # --- I/O ---
-
-    @property
-    def vocab_size(self) -> int:
-        return len(self.stoi)
+    def decode_with_special(self, ids: List[int]) -> str:
+        """Token id listesini metne çevirir (special token'lar dahil)."""
+        return self.decode(ids, skip_special_tokens=False)
 
     def save(self, path: str | Path) -> None:
         """Vocab'ı JSON olarak kaydeder."""
@@ -149,6 +196,7 @@ class BPETokenizer:
         data = {
             "merges": [f"{a} {b}" for a, b in self.merges],
             "vocab": self.stoi,
+            "special_tokens": self.special_tokens,
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -158,18 +206,30 @@ class BPETokenizer:
         """Vocab'ı JSON'dan yükler."""
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return cls(merges=data.get("merges", []), vocab=data.get("vocab", {}))
+        return cls(
+            merges=data.get("merges", []),
+            vocab=data.get("vocab", {}),
+            special_tokens=data.get("special_tokens", list(SPECIAL_TOKENS.keys())),
+        )
+
+    @property
+    def vocab_size(self) -> int:
+        return len(self.stoi)
 
 
-# Geriye dönük uyumluluk: eski kod CharTokenizer kullanıyor.
 CharTokenizer = BPETokenizer
 
 
 if __name__ == "__main__":
     text = "merhaba dünya merhaba dünya merhaba"
     tok = BPETokenizer.build(text, vocab_size=50)
-    ids = tok.encode("merhaba dünya")
+    ids = tok.encode("merhaba dünya", add_special_tokens=True)
     print("Vocab size:", tok.vocab_size)
+    print("BOS ID:", tok.bos_id)
+    print("EOS ID:", tok.eos_id)
+    print("PAD ID:", tok.pad_id)
+    print("UNK ID:", tok.unk_id)
     print("Merges:", tok.merges[:10])
     print("Encoded:", ids)
     print("Decoded:", tok.decode(ids))
+    print("Decoded (with special):", tok.decode_with_special(ids))
