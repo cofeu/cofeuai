@@ -109,13 +109,55 @@ def save_checkpoint(
     logger.info("Checkpoint kaydedildi: %s (iter %d)", path, iteration)
 
 
+def export_binary(ckpt_path: Path, out_path: Path) -> bool:
+    """PyTorch checkpoint'ını C++ .bin formatına aktarır.
+
+    Eğitimin hemen ardından sunucuyu çalıştırabilmek için gereklidir: sunucu
+    önce `cofeu.bin` arar, yoksa PyTorch'a düşer. Export başarısız olursa
+    eğitim sonucu yine de geçerli — sadece PyTorch yolu kullanılır.
+    """
+    try:
+        from export import export
+
+        n = export(ckpt_path, out_path)
+        logger.info("C++ model dışa aktarıldı: %s (%d ağırlık)", out_path, n)
+        return True
+    except Exception as e:
+        logger.error("C++ export BAŞARISIZ: %s", e)
+        logger.error("  → Sunucu PyTorch yoluna düşecek (daha yavaş).")
+        logger.error("  → Elle dene: python export.py --ckpt %s --out %s", ckpt_path, out_path)
+        return False
+
+
 def load_checkpoint(path: Path, model: CofeuTransformer, optimizer: torch.optim.Optimizer):
-    """Checkpoint yükler, resume için."""
+    """Checkpoint yükler, resume için.
+
+    RoPE öncesi (öğrenilmiş `pos_emb` içeren) checkpoint'ler resume edilemez:
+    mimari tamamen farklı, sessizce yüklenip yanlış sonuç üretmemelidir.
+    """
     if not path.exists():
+        logger.warning("Resume checkpoint bulunamadı: %s — sıfırdan başlanıyor", path)
         return 0, {}
 
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    model.load_state_dict(ckpt["model_state"])
+
+    stale = [k for k in ckpt.get("model_state", {}) if "pos_emb" in k or "attn.mask" in k]
+    if stale:
+        raise SystemExit(
+            f"HATA: {path} eski formatta ({stale[0]} içeriyor).\n"
+            "Bu checkpoint öğrenilmiş mutlak konum gömmesiyle eğitilmiş; mevcut\n"
+            "model RoPE + sliding KV cache kullanıyor, bu yüzden resume edilemez.\n"
+            "  → Yeni bir eğitim başlatın (--resume kullanmayın)."
+        )
+
+    try:
+        model.load_state_dict(ckpt["model_state"])
+    except RuntimeError as e:
+        raise SystemExit(
+            f"HATA: {path} bu mimariyle eşleşmiyor.\n  {e}\n"
+            "  → Mimari argümanlarını checkpoint ile aynı yapın veya sıfırdan eğitin."
+        ) from e
+
     if "optimizer_state" in ckpt and optimizer is not None:
         optimizer.load_state_dict(ckpt["optimizer_state"])
 
@@ -183,7 +225,27 @@ def main():
     parser.add_argument("--resume", action="store_true", help="Son checkpoint'tan devam et")
     parser.add_argument("--tb-log-dir", type=str, default=None, help="TensorBoard log dizini")
     parser.add_argument("--eval-iters", type=int, default=20, help="Eval iterasyon sayısı")
+
+    mimari = parser.add_argument_group("model mimarisi")
+    mimari.add_argument("--n-embd", type=int, default=256, help="Gömme boyutu")
+    mimari.add_argument("--n-head", type=int, default=4, help="Dikkat başı sayısı")
+    mimari.add_argument("--n-layer", type=int, default=4, help="Transformer katman sayısı")
+    mimari.add_argument("--block-size", type=int, default=256, help="Eğitim bağlam uzunluğu")
+    mimari.add_argument("--rope-base", type=float, default=10000.0, help="RoPE taban frekansı")
+
+    cikti = parser.add_argument_group("çıktı")
+    cikti.add_argument("--no-export", action="store_true",
+                       help="Eğitim sonunda C++ .bin üretme")
+    cikti.add_argument("--export-every", type=int, default=0,
+                       help="Bu iterasyon aralığıyla da .bin yenile (0 = sadece son)")
     args = parser.parse_args()
+
+    if args.n_embd % args.n_head != 0:
+        parser.error(f"--n-embd ({args.n_embd}) --n-head ({args.n_head}) ile bölünmeli")
+    if args.block_size < 2:
+        parser.error("--block-size en az 2 olmalı")
+    if args.grad_accum < 1:
+        parser.error("--grad-accum en az 1 olmalı")
 
     device = (
         args.device
@@ -231,6 +293,11 @@ def main():
     config = ModelConfig(
         vocab_size=tokenizer.vocab_size,
         eos_token_id=tokenizer.eos_id,
+        n_embd=args.n_embd,
+        n_head=args.n_head,
+        n_layer=args.n_layer,
+        block_size=args.block_size,
+        rope_base=args.rope_base,
     )
     model = CofeuTransformer(config).to(device)
     n_params = sum(p.numel() for p in model.parameters())
@@ -323,7 +390,12 @@ def main():
             # En iyi model
             if val_metrics["loss"] < best_val_loss:
                 best_val_loss = val_metrics["loss"]
-                save_checkpoint(model, optimizer, config, tokenizer, it, val_metrics["loss"], train_metrics, OUT_DIR / "cofeu_best.pt")
+                best_path = OUT_DIR / "cofeu_best.pt"
+                save_checkpoint(model, optimizer, config, tokenizer, it, val_metrics["loss"], train_metrics, best_path)
+                # Sunucu daima cofeu.bin arar; en iyi modeli hemen yayınla ki
+                # uzun eğitimlerde arada bir çalıştırılabilir olsun.
+                if not args.no_export:
+                    export_binary(best_path, OUT_DIR / "cofeu_best.bin")
 
         # Gradient accumulation
         optimizer.zero_grad(set_to_none=True)
@@ -355,7 +427,10 @@ def main():
 
         # Periyodik checkpoint
         if it > 0 and it % args.save_interval == 0:
-            save_checkpoint(model, optimizer, config, tokenizer, it, best_val_loss, {}, OUT_DIR / "cofeu_latest.pt")
+            latest_path = OUT_DIR / "cofeu_latest.pt"
+            save_checkpoint(model, optimizer, config, tokenizer, it, best_val_loss, {}, latest_path)
+            if not args.no_export and args.export_every and it % args.export_every == 0:
+                export_binary(latest_path, OUT_DIR / "cofeu.bin")
 
     # Son checkpoint
     final_metrics = estimate_loss(model, val_data, config.block_size, args.batch_size, device, args.eval_iters)
@@ -365,6 +440,8 @@ def main():
     )
 
     save_checkpoint(model, optimizer, config, tokenizer, args.max_iters, final_metrics["loss"], final_metrics, OUT_DIR / "cofeu.pt")
+    # Resume noktası: son durumu 'latest' olarak da tut ki --resume çalışsın.
+    save_checkpoint(model, optimizer, config, tokenizer, args.max_iters, final_metrics["loss"], final_metrics, OUT_DIR / "cofeu_latest.pt")
     tokenizer.save(OUT_DIR / "vocab.json")
 
     if writer is not None:
@@ -372,6 +449,16 @@ def main():
 
     logger.info("Model kaydedildi: %s", OUT_DIR / "cofeu.pt")
     logger.info("Vocab kaydedildi: %s", OUT_DIR / "vocab.json")
+
+    # C++ motoru için nihai export: sunucu önce bunu arar.
+    if not args.no_export:
+        logger.info("C++ formatına aktarılıyor...")
+        if export_binary(OUT_DIR / "cofeu.pt", OUT_DIR / "cofeu.bin"):
+            logger.info(
+                "Tamamlandı. Çalıştırmak için:\n"
+                "  python server.py     # http://localhost:8000\n"
+                "  python generate.py \"Bir zamanlar\" --stream"
+            )
 
 
 if __name__ == "__main__":

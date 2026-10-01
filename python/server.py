@@ -5,6 +5,7 @@ edebileceğiniz güzel bir arayüz sağlar.
 
 Özellikler:
   - Streaming SSE endpoint (token-by-token)
+  - C++ inference motoru (varsa) — PyTorch'a otomatik düşüş
   - Sampling parametreleri (top-k, top-p, repetition penalty)
   - Structured logging
   - Health check
@@ -13,22 +14,27 @@ edebileceğiniz güzel bir arayüz sağlar.
     cd python
     ../.venv/bin/python server.py
     # Tarayıcıda: http://localhost:8000
+
+Not: Ne C++ motoru ne de PyTorch modeli thread-safe'dir (KV cache ve workspace
+tamponlarını paylaşırlar). Bu yüzden her üretim `Backend.lock()` üzerinden
+geçer; eşzamanlı istekler sıraya girer.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import threading
 import time
-from pathlib import Path
+from typing import Optional
 
-import torch
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from model import CofeuTransformer, ModelConfig
-from tokenizer import BPETokenizer
+import runtime
+from runtime import Backend, ModelLoadError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,69 +43,46 @@ logging.basicConfig(
 )
 logger = logging.getLogger("cofeu.server")
 
-ROOT = Path(__file__).resolve().parent.parent
-CKPT_PATH = ROOT / "checkpoints" / "cofeu.pt"
-VOCAB_PATH = ROOT / "checkpoints" / "vocab.json"
-BIN_PATH = ROOT / "checkpoints" / "cofeu.bin"
-
 app = FastAPI(title="CofeuAI", description="Kendi LLM'imiz — sıfırdan eğitildi")
 
-_model = None
-_tokenizer = None
-_cpp_model = None
-_cpp_tokenizer = None
+_backend: Optional[Backend] = None
+_load_error: Optional[str] = None
 
 
-def load_model():
-    global _model, _tokenizer
-    if _model is not None:
-        return _model, _tokenizer
-
-    if not CKPT_PATH.exists():
-        raise RuntimeError("Model bulunamadı. Önce eğitim yapın: python train.py")
-
-    ckpt = torch.load(CKPT_PATH, map_location="cpu", weights_only=False)
-    config: ModelConfig = ckpt["config"]
-    _tokenizer = BPETokenizer(
-        merges=ckpt.get("merges", []),
-        vocab=ckpt["vocab"],
-        special_tokens=ckpt.get("special_tokens"),
-    )
-    _model = CofeuTransformer(config)
-    _model.load_state_dict(ckpt["model_state"])
-    _model.eval()
-    logger.info("Model yüklendi (%.2fM parametre)", sum(p.numel() for p in _model.parameters()) / 1e6)
-    return _model, _tokenizer
-
-
-def load_cpp():
-    global _cpp_model, _cpp_tokenizer
-    if _cpp_model is not None:
-        return _cpp_model, _cpp_tokenizer
+def load_backend() -> Backend:
+    """Modeli bir kez yükler, sonraki isteklerde aynısını döndürür."""
+    global _backend, _load_error
+    if _backend is not None:
+        return _backend
+    if _load_error is not None:
+        raise HTTPException(status_code=503, detail=_load_error)
     try:
-        from cpp_bridge import CppModel, CppTokenizer
-
-        _cpp_tokenizer = CppTokenizer(VOCAB_PATH)
-        _cpp_model = CppModel(BIN_PATH)
-        logger.info("C++ inference motoru yüklendi")
-        return _cpp_model, _cpp_tokenizer
-    except Exception:
-        return None, None
+        _backend = runtime.load_backend()
+        logger.info("Motor hazır: %s", _backend.name)
+    except ModelLoadError as e:
+        _load_error = str(e)
+        logger.error("Model yüklenemedi: %s", e)
+        raise HTTPException(status_code=503, detail=_load_error)
+    return _backend
 
 
 class GenerateRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=10000, description="Başlangıç metni")
     max_tokens: int = Field(default=200, ge=1, le=4096, description="Maksimum token sayısı")
-    temperature: float = Field(default=0.8, ge=0.01, le=2.0, description="Sıcaklık")
+    temperature: float = Field(default=0.8, ge=0.0, le=2.0,
+                               description="Sıcaklık (0 = greedy)")
     top_k: int | None = Field(default=None, ge=1, le=1000, description="Top-k sampling")
-    top_p: float | None = Field(default=None, ge=0.0, le=1.0, description="Top-p (nucleus) sampling")
+    top_p: float | None = Field(default=None, ge=0.0, le=1.0,
+                                description="Top-p (nucleus) sampling")
     repetition_penalty: float = Field(default=1.0, ge=0.5, le=5.0, description="Tekrar cezası")
+    seed: int = Field(default=0, ge=0, description="Tohum (0 = rastgele)")
 
 
 class GenerateResponse(BaseModel):
     text: str
     tokens_generated: int = 0
     elapsed_ms: float = 0.0
+    engine: str = ""
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -109,74 +92,120 @@ def index():
 
 @app.post("/generate", response_model=GenerateResponse)
 def generate(req: GenerateRequest):
-    start_time = time.time()
-    logger.info("İstek: prompt='%s', max_tokens=%d, temp=%.2f", req.prompt[:50], req.max_tokens, req.temperature)
-
-    cpp_model, cpp_tok = load_cpp()
-    if cpp_model is not None:
-        prompt_ids = cpp_tok.encode(req.prompt)
-        out_ids = cpp_model.generate(prompt_ids, req.max_tokens, req.temperature)
-        text = cpp_tok.decode(out_ids)
-        elapsed = (time.time() - start_time) * 1000
-        logger.info("C++ üretim tamamlandı (%.0fms)", elapsed)
-        return GenerateResponse(text=text, tokens_generated=len(out_ids) - len(prompt_ids), elapsed_ms=elapsed)
-
-    model, tokenizer = load_model()
-    prompt_ids = tokenizer.encode(req.prompt)
-    idx = torch.tensor([prompt_ids], dtype=torch.long)
-
-    eos_id = tokenizer.eos_id if tokenizer.eos_id >= 0 else model.config.eos_token_id
-
-    out = model.generate(
-        idx, req.max_tokens, temperature=req.temperature,
-        top_k=req.top_k, top_p=req.top_p,
-        repetition_penalty=req.repetition_penalty,
-        eos_token_id=eos_id,
+    backend = load_backend()
+    start = time.time()
+    logger.info(
+        "İstek: prompt='%s' max_tokens=%d temp=%.2f top_k=%s top_p=%s rp=%.2f",
+        req.prompt[:60], req.max_tokens, req.temperature,
+        req.top_k, req.top_p, req.repetition_penalty,
     )
-    text = tokenizer.decode(out[0].tolist())
 
-    elapsed = (time.time() - start_time) * 1000
-    tokens_generated = out.shape[1] - len(prompt_ids)
-    logger.info("Üretim tamamlandı: %d token (%.0fms)", tokens_generated, elapsed)
+    prompt_ids = backend.tokenizer.encode(req.prompt)
+    if not prompt_ids:
+        raise HTTPException(status_code=400, detail="Prompt tokenize edilemedi")
 
-    return GenerateResponse(text=text, tokens_generated=tokens_generated, elapsed_ms=elapsed)
+    try:
+        ids = runtime.generate_ids(
+            backend, prompt_ids, req.max_tokens,
+            temperature=req.temperature, top_k=req.top_k, top_p=req.top_p,
+            repetition_penalty=req.repetition_penalty,
+            eos_token_id=backend.tokenizer.eos_id, seed=req.seed,
+        )
+    except RuntimeError as e:
+        logger.error("Üretim hatası: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    elapsed = (time.time() - start) * 1000
+    logger.info("Üretim tamamlandı: %d token (%.0f ms, %.0f tok/s)",
+                len(ids), elapsed, len(ids) / max(elapsed / 1000, 1e-9))
+    return GenerateResponse(
+        text=backend.tokenizer.decode(ids),
+        tokens_generated=len(ids),
+        elapsed_ms=elapsed,
+        engine=backend.name,
+    )
 
 
 @app.post("/generate/stream")
 async def generate_stream(req: GenerateRequest, request: Request):
     """Streaming SSE endpoint — token-by-token üretim."""
-    logger.info("Streaming istek: prompt='%s', max_tokens=%d", req.prompt[:50], req.max_tokens)
+    backend = load_backend()
+    prompt_ids = backend.tokenizer.encode(req.prompt)
+    if not prompt_ids:
+        raise HTTPException(status_code=400, detail="Prompt tokenize edilemedi")
 
-    model, tokenizer = load_model()
-    prompt_ids = tokenizer.encode(req.prompt)
-    idx = torch.tensor([prompt_ids], dtype=torch.long)
-    eos_id = tokenizer.eos_id if tokenizer.eos_id >= 0 else model.config.eos_token_id
+    logger.info("Streaming istek: prompt='%s' max_tokens=%d (motor=%s)",
+                req.prompt[:60], req.max_tokens, backend.name)
+    tok = backend.tokenizer
+    eos = tok.eos_id
 
     async def event_generator():
-        start_time = time.time()
-        token_count = 0
+        start = time.time()
+        count = 0
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+        stop = threading.Event()
 
-        for token_tensor in model.generate_stream(
-            idx, req.max_tokens, temperature=req.temperature,
-            top_k=req.top_k, top_p=req.top_p,
+        # runtime.stream_ids senkron bir generator'dır ve kilidi tutar; event
+        # loop'unu bloklamamak için ayrı bir thread'de tüketiyoruz. Her token
+        # üretildiği anda kuyruğa düşer, yani akış gerçekten token-by-token.
+        gen = runtime.stream_ids(
+            backend, prompt_ids, req.max_tokens,
+            temperature=req.temperature, top_k=req.top_k, top_p=req.top_p,
             repetition_penalty=req.repetition_penalty,
-            eos_token_id=eos_id,
-        ):
-            if await request.is_disconnected():
-                logger.info("Streaming istek kesildi")
-                break
+            eos_token_id=eos, seed=req.seed,
+        )
 
-            token_id = token_tensor.item()
-            decoded = tokenizer.decode([token_id])
-            token_count += 1
+        def _pump() -> None:
+            """Generator'ı süren tek thread. close() da burada çağrılır ki
+            generator'a eşzamanlı erişim olmasın."""
+            try:
+                for token in gen:
+                    loop.call_soon_threadsafe(queue.put_nowait, ("token", token))
+                    if stop.is_set():
+                        break
+                else:
+                    loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
+            except BaseException as exc:  # noqa: BLE001
+                loop.call_soon_threadsafe(queue.put_nowait, ("error", exc))
+            finally:
+                gen.close()  # kilidi burada serbest bırakır
 
-            data = json.dumps({"token": decoded, "token_id": token_id, "count": token_count})
-            yield f"data: {data}\n\n"
+        threading.Thread(target=_pump, name="cofeu-sse", daemon=True).start()
 
-        elapsed = (time.time() - start_time) * 1000
-        done_data = json.dumps({"done": True, "tokens": token_count, "elapsed_ms": elapsed})
-        yield f"data: {done_data}\n\n"
-        logger.info("Streaming tamamlandı: %d token (%.0fms)", token_count, elapsed)
+        try:
+            while True:
+                kind, payload = await queue.get()
+
+                if kind == "done":
+                    break
+                if kind == "error":
+                    logger.error("Streaming hatası: %s", payload)
+                    yield "data: " + json.dumps(
+                        {"error": str(payload)}
+                    ) + "\n\n"
+                    return
+
+                if await request.is_disconnected():
+                    logger.info("İstemci koptu, üretim durduruluyor")
+                    stop.set()
+                    return
+
+                count += 1
+                yield "data: " + json.dumps({
+                    "token": tok.decode([payload]),
+                    "token_id": payload,
+                    "count": count,
+                }) + "\n\n"
+
+            elapsed = (time.time() - start) * 1000
+            yield "data: " + json.dumps({
+                "done": True, "tokens": count, "elapsed_ms": elapsed,
+                "engine": backend.name,
+            }) + "\n\n"
+            logger.info("Streaming tamamlandı: %d token (%.0f ms)", count, elapsed)
+        finally:
+            stop.set()
 
     return StreamingResponse(
         event_generator(),
@@ -191,13 +220,61 @@ async def generate_stream(req: GenerateRequest, request: Request):
 
 @app.get("/health")
 def health():
-    cpp_model, _ = load_cpp()
-    model_loaded = _model is not None or cpp_model is not None
-    return {
+    """Sağlık kontrolü + yüklü motor bilgisi."""
+    try:
+        backend = load_backend()
+    except HTTPException as e:
+        return {"status": "unavailable", "detail": e.detail}
+
+    info = {
         "status": "ok",
-        "model_loaded": model_loaded,
-        "cpp_available": cpp_model is not None,
+        "model_loaded": True,
+        "engine": backend.name,
+        "vocab_size": backend.tokenizer.vocab_size,
+        "eos_token_id": backend.tokenizer.eos_id,
     }
+    if backend.uses_cpp:
+        info.update({
+            "cpp_available": True,
+            "block_size": backend.model.block_size,
+            "max_position": backend.model.max_position,
+        })
+    else:
+        cfg = backend.model.config
+        info.update({
+            "cpp_available": False,
+            "n_embd": cfg.n_embd,
+            "n_head": cfg.n_head,
+            "n_layer": cfg.n_layer,
+            "block_size": cfg.block_size,
+            "rope_base": cfg.rope_base,
+        })
+    return info
+
+
+@app.get("/model")
+def model_info():
+    """Eğitilmiş modelin mimarisi."""
+    backend = load_backend()
+    if backend.uses_cpp:
+        return {
+            "engine": backend.name,
+            "vocab_size": backend.model.vocab_size,
+            "block_size": backend.model.block_size,
+            "max_position": backend.model.max_position,
+        }
+    cfg = backend.model.config
+    return {
+        "engine": backend.name,
+        "vocab_size": cfg.vocab_size,
+        "n_embd": cfg.n_embd,
+        "n_head": cfg.n_head,
+        "n_layer": cfg.n_layer,
+        "block_size": cfg.block_size,
+        "rope_base": cfg.rope_base,
+        "n_params": cfg.n_params(),
+    }
+
 
 
 HTML_PAGE = """<!DOCTYPE html>
@@ -472,11 +549,29 @@ input.addEventListener('keydown', (e) => {
 
 
 if __name__ == "__main__":
+    import argparse
+
     import uvicorn
 
-    try:
-        load_model()
-    except RuntimeError as e:
-        logger.warning("Model yüklenemedi: %s", e)
+    ap = argparse.ArgumentParser(description="CofeuAI web sunucusu")
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--python", action="store_true", help="PyTorch motoru (C++ yerine)")
+    ap.add_argument("--cuda", action="store_true", help="PyTorch yolunda GPU kullan")
+    ap.add_argument("--reload", action="store_true", help="Geliştirme için auto-reload")
+    args = ap.parse_args()
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Modeli başlangıçta yükle: ilk istekte beklemek yerine hata hemen görünsün.
+    try:
+        bk = runtime.load_backend(
+            prefer_cpp=not args.python, device="cuda" if args.cuda else "cpu"
+        )
+        _backend = bk
+        if bk.uses_cpp:
+            logger.info("C++ motoru: V=%d block=%d max_pos=%d",
+                        bk.model.vocab_size, bk.model.block_size, bk.model.max_position)
+    except ModelLoadError as e:
+        logger.error("Model yüklenemedi:\n%s", e)
+        logger.error("Sunucu yine de başlıyor; /health 'unavailable' dönecek.")
+
+    uvicorn.run(app, host=args.host, port=args.port, reload=args.reload)

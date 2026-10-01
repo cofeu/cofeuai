@@ -32,6 +32,7 @@ CofeuAI/
 │   ├── make_corpus.py           # Daha büyük corpus oluşturma
 │   ├── download_dataset.py      # Wikipedia'dan Türkçe dataset indirme
 │   ├── cpp_bridge.py            # C++ kütüphanesi bridge
+│   ├── runtime.py               # Ortak model yükleme + üretim katmanı
 │   └── server.py                # FastAPI web sunucusu (SSE streaming)
 ├── cpp/
 │   ├── CMakeLists.txt
@@ -54,8 +55,57 @@ CofeuAI/
 pip install -r requirements.txt
 
 # C++ build (CMake gerekli)
-cd cpp && mkdir -p build && cd build && cmake .. && make
+cd cpp && mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && make
 ```
+
+## Konumsal Kodlama: RoPE + Sliding KV Cache
+
+Model **öğrenilmiş mutlak konum gömmesi** (`pos_emb`) kullanmaz. Yerine:
+
+- **RoPE (Rotary Position Embedding)**: konum bilgisi Q/K vektörlerine
+  döndürme olarak uygulanır. Başlangıçta hiçbir şey öğrenilmez; frekanslar
+  `rope_base` (varsayılan 10000) ile belirlenir. Daha uzun bağlamlara
+  ekstrapolasyon yapabilir.
+- **Sliding KV cache**: `block_size` uzunluğunda bir pencere tutulur. Uzun
+  metinlerde bellek `O(block_size)` ile sınırlı kalır; dikkat yalnızca son
+  `block_size` tokenı görür.
+
+`model.py`, `model.cpp` ve `export.py` bu iki kavramı birebir aynı semantikle
+uygular — PyTorch ile C++ arasında logit farkı `~1e-7` mertebesindedir.
+
+> ### ⚠️ RoPE'ye geçiş: eski checkpoint'lar kullanılamaz
+>
+> Bu değişiklikten **önce** eğitilmiş `checkpoints/*.pt` ve `*.bin` dosyaları
+> (`pos_emb` veya `blocks.N.attn.mask` içerir) yeni modelle **yüklenemez** —
+> mimari tamamen farklı. Eğitim durumu geri dönüşümsüz biçimde kaybolur.
+>
+> Yeni model eğitmek zorundasınız:
+>
+> ```bash
+> cd python
+> python train.py            # RoPE ile sıfırdan eğitir
+> ```
+>
+> `train.py` eğitim bitince `cofeu.bin` dosyasını **otomatik** üretir, yani
+> ayrıca `export.py` çalıştırmanız gerekmez.
+
+## Model Dosya Formatı (`cofeu.bin`)
+
+C++ motorunun okuduğu dosya sıralı (little-endian) yazılır:
+
+| Alan | Tip | Açıklama |
+|---|---|---|
+| `magic` | `char[4]` | `"COFE"` |
+| `version` | `int32` | `2` |
+| `vocab_size` | `int32` | Tokenizer boyutu |
+| `n_embd` | `int32` | Gömme boyutu |
+| `n_head` | `int32` | Dikkat başı sayısı |
+| `n_layer` | `int32` | Katman sayısı |
+| `block_size` | `int32` | KV cache pencere uzunluğu |
+| `rope_base` | `float32` | RoPE taban frekansı |
+| `weights…` | `float32[]` | Katman ağırlıkları (tensor başına satır/sütun düzende) |
+
+Header 32 bayttır. Yanlış imza veya sürüm okunursa motor açık bir hata verir.
 
 ## Kullanım
 
@@ -68,15 +118,35 @@ python download_dataset.py --max-chars 5000000
 ### 2. Eğitim
 ```bash
 cd python
+
+# Varsayılan mimari ile hızlı başlangıç
 python train.py --max-iters 5000 --vocab-size 2048
 
-# Resume ile devam et
-python train.py --resume --max-iters 10000
+# Model boyutunu sen belirle
+python train.py --n-embd 512 --n-head 8 --n-layer 6 --block-size 512 --max-iters 20000
+
+# GPU'da karışık hassasiyet + gradient accumulation
+python train.py --amp --grad-accum 4 --batch-size 16
+
+# Resume ile devam et (cofeu_latest.pt'den)
+python train.py --resume --max-iters 20000
 
 # TensorBoard ile takip
-python train.py --max-iters 5000
 tensorboard --logdir checkpoints/tb_logs
 ```
+
+Eğitim bittiğinde şunlar yazılır:
+
+| Dosya | İçerik |
+|---|---|
+| `cofeu.pt` | Son model (PyTorch) |
+| `cofeu_latest.pt` | Resume noktası |
+| `cofeu_best.pt` | En düşük val loss'lu model |
+| `vocab.json` | Eğitilmiş BPE tokenizer |
+| `cofeu.bin` | C++ motoru için dışa aktarılmış model |
+
+`cofeu.bin` üretilmezse sunucu ve `generate.py` otomatik olarak PyTorch
+yoluna düşer (çalışır, ama daha yavaştır).
 
 ### 3. Python ile üretim
 ```bash

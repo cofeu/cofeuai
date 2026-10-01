@@ -1,13 +1,19 @@
 """CofeuAI Metin Üretimi.
 
 Eğitilmiş modeli yükleyip metin üretir. C++ inference motoru varsa onu
-kullanır (çok daha hızlı), yoksa Python'a düşer.
+kullanır (çok daha hızlı), yoksa PyTorch'a düşer.
 
 Özellikler:
   - Top-k, top-p, repetition penalty sampling
-  - Token-by-token streaming üretim
+  - Token-by-token streaming (her iki motor için de)
   - EOS (stop token) desteği
+  - --seed ile tekrarlanabilir çıktı
   - Structured logging
+
+Kullanım:
+    cd python
+    ../.venv/bin/python generate.py "Bir zamanlar" --stream
+    ../.venv/bin/python generate.py "Merhaba" --temperature 0.7 --top-k 40 --top-p 0.95
 """
 
 from __future__ import annotations
@@ -16,12 +22,10 @@ import argparse
 import logging
 import time
 from pathlib import Path
-from typing import Generator
+from typing import Iterator, Optional
 
-import torch
-
-from model import CofeuTransformer, ModelConfig
-from tokenizer import BPETokenizer
+import runtime
+from runtime import Backend, ModelLoadError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,160 +34,112 @@ logging.basicConfig(
 )
 logger = logging.getLogger("cofeu.generate")
 
-ROOT = Path(__file__).resolve().parent.parent
-CKPT_PATH = ROOT / "checkpoints" / "cofeu.pt"
-VOCAB_PATH = ROOT / "checkpoints" / "vocab.json"
-BIN_PATH = ROOT / "checkpoints" / "cofeu.bin"
 
-
-def generate_cpp(
-    prompt: str,
+def _stream_text(
+    backend: Backend,
+    prompt_ids: list[int],
     max_tokens: int,
     temperature: float,
-    top_k: int | None = None,
-    top_p: float | None = None,
-    repetition_penalty: float = 1.0,
-    stream: bool = False,
-) -> str | None:
-    """C++ inference motoru ile üretim."""
-    try:
-        from cpp_bridge import CppModel, CppTokenizer
-
-        tok = CppTokenizer(VOCAB_PATH)
-        model = CppModel(BIN_PATH)
-        prompt_ids = tok.encode(prompt)
-        out_ids = model.generate(prompt_ids, max_tokens, temperature)
-        return tok.decode(out_ids)
-    except Exception as e:
-        logger.warning("C++ kullanılamadı: %s", e)
-        return None
-
-
-def generate_python(
-    prompt: str,
-    max_tokens: int,
-    temperature: float,
-    top_k: int | None = None,
-    top_p: float | None = None,
-    repetition_penalty: float = 1.0,
-    stream: bool = False,
-) -> str | Generator[str, None, None]:
-    """Python (PyTorch) ile üretim."""
-    if not CKPT_PATH.exists():
-        raise FileNotFoundError(f"Model bulunamadı: {CKPT_PATH}")
-
-    ckpt = torch.load(CKPT_PATH, map_location="cpu", weights_only=False)
-    config: ModelConfig = ckpt["config"]
-    tokenizer = BPETokenizer(
-        merges=ckpt.get("merges", []),
-        vocab=ckpt["vocab"],
-        special_tokens=ckpt.get("special_tokens"),
-    )
-
-    model = CofeuTransformer(config)
-    model.load_state_dict(ckpt["model_state"])
-    model.eval()
-
-    prompt_ids = tokenizer.encode(prompt)
-    idx = torch.tensor([prompt_ids], dtype=torch.long)
-
-    eos_id = tokenizer.eos_id if tokenizer.eos_id >= 0 else config.eos_token_id
-
-    if stream:
-        return _stream_python(model, tokenizer, idx, max_tokens, temperature, top_k, top_p, repetition_penalty, eos_id)
-    else:
-        out = model.generate(
-            idx, max_tokens, temperature=temperature,
-            top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty,
-            eos_token_id=eos_id,
-        )
-        return tokenizer.decode(out[0].tolist())
-
-
-def _stream_python(
-    model: CofeuTransformer,
-    tokenizer: BPETokenizer,
-    idx: torch.Tensor,
-    max_tokens: int,
-    temperature: float,
-    top_k: int | None,
-    top_p: float | None,
+    top_k: Optional[int],
+    top_p: Optional[float],
     repetition_penalty: float,
-    eos_id: int,
-) -> Generator[str, None, None]:
-    """Token-by-token streaming üretim."""
-    for token_tensor in model.generate_stream(
-        idx, max_tokens, temperature=temperature,
-        top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty,
-        eos_token_id=eos_id,
+    seed: int,
+) -> Iterator[str]:
+    """Token id'lerini çözerek parça parça metin üretir."""
+    eos = backend.tokenizer.eos_id
+    for token_id in runtime.stream_ids(
+        backend, prompt_ids, max_tokens,
+        temperature=temperature, top_k=top_k, top_p=top_p,
+        repetition_penalty=repetition_penalty, eos_token_id=eos, seed=seed,
     ):
-        token_id = token_tensor.item()
-        decoded = tokenizer.decode([token_id])
-        yield decoded
+        yield backend.tokenizer.decode([token_id])
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(description="CofeuAI ile metin üret")
     parser.add_argument("prompt", type=str, help="Başlangıç metni")
     parser.add_argument("--max-tokens", type=int, default=200)
-    parser.add_argument("--temperature", type=float, default=0.8)
-    parser.add_argument("--top-k", type=int, default=None, help="Top-k sampling (varsayılan: tümü)")
-    parser.add_argument("--top-p", type=float, default=None, help="Top-p (nucleus) sampling")
-    parser.add_argument("--repetition-penalty", type=float, default=1.0, help="Tekrar cezası (1.0=kapalı)")
-    parser.add_argument("--stream", action="store_true", help="Token-by-token streaming çıktı")
-    parser.add_argument("--python", action="store_true", help="Python ile üret (C++ yerine)")
+    parser.add_argument("--temperature", type=float, default=0.8,
+                        help="0 -> greedy, >0 -> örnekleme")
+    parser.add_argument("--top-k", type=int, default=None,
+                        help="Top-k sampling (varsayılan: tümü)")
+    parser.add_argument("--top-p", type=float, default=None,
+                        help="Top-p (nucleus) sampling")
+    parser.add_argument("--repetition-penalty", type=float, default=1.0,
+                        help="Tekrar cezası (1.0=kapalı)")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Rastgelelik tohumu (0 = gerçek rastgele)")
+    parser.add_argument("--stream", action="store_true",
+                        help="Token-by-token streaming çıktı")
+    parser.add_argument("--python", action="store_true",
+                        help="PyTorch ile üret (C++ motoru yerine)")
+    parser.add_argument("--cuda", action="store_true",
+                        help="PyTorch yolunda GPU kullan")
     args = parser.parse_args()
 
-    if not CKPT_PATH.exists():
-        logger.error("Model bulunamadı: %s", CKPT_PATH)
-        logger.info("Önce eğitim yapın: python train.py")
-        return
+    if args.max_tokens < 1:
+        logger.error("--max-tokens pozitif olmalı")
+        return 2
 
-    logger.info(
-        "Üretim: prompt='%s', max_tokens=%d, temp=%.2f, top_k=%s, top_p=%s, rep_penalty=%.2f",
-        args.prompt, args.max_tokens, args.temperature,
-        args.top_k, args.top_p, args.repetition_penalty,
-    )
-
-    start_time = time.time()
-
-    if not args.python and BIN_PATH.exists():
-        text = generate_cpp(
-            args.prompt, args.max_tokens, args.temperature,
-            args.top_k, args.top_p, args.repetition_penalty,
+    try:
+        backend = runtime.load_backend(
+            prefer_cpp=not args.python, device="cuda" if args.cuda else "cpu"
         )
-        if text is not None:
-            elapsed = time.time() - start_time
-            logger.info("C++ ile üretim tamamlandı (%.2fs)", elapsed)
-            print(text)
-            return
+    except ModelLoadError as e:
+        logger.error("%s", e)
+        return 1
 
-    if args.stream:
-        logger.info("Streaming üretim başlatılıyor...")
-        gen = generate_python(
-            args.prompt, args.max_tokens, args.temperature,
-            args.top_k, args.top_p, args.repetition_penalty,
-            stream=True,
+    with backend:
+        prompt_ids = backend.tokenizer.encode(args.prompt)
+        if not prompt_ids:
+            logger.error("Prompt tokenize edilemedi (boş veya bilinmeyen karakterler)")
+            return 1
+
+        logger.info(
+            "Motor: %s | prompt %d token | max_tokens=%d temp=%.2f top_k=%s "
+            "top_p=%s rep_penalty=%.2f seed=%d",
+            backend.name, len(prompt_ids), args.max_tokens, args.temperature,
+            args.top_k, args.top_p, args.repetition_penalty, args.seed,
         )
-        token_count = 0
-        try:
-            for chunk in gen:
-                print(chunk, end="", flush=True)
-                token_count += 1
-            print()  # Yeni satır
-        except KeyboardInterrupt:
-            print("\nÜretim kesildi.")
-        elapsed = time.time() - start_time
-        logger.info("Streaming üretim tamamlandı: %d token (%.2fs)", token_count, elapsed)
-    else:
-        text = generate_python(
-            args.prompt, args.max_tokens, args.temperature,
-            args.top_k, args.top_p, args.repetition_penalty,
-        )
-        elapsed = time.time() - start_time
-        logger.info("Üretim tamamlandı (%.2fs)", elapsed)
-        print(text)
+        if backend.uses_cpp:
+            logger.info("  V=%d block=%d max_pos=%d",
+                        backend.model.vocab_size,
+                        backend.model.block_size,
+                        backend.model.max_position)
+
+        start = time.time()
+
+        if args.stream:
+            count = 0
+            try:
+                for chunk in _stream_text(
+                    backend, prompt_ids, args.max_tokens, args.temperature,
+                    args.top_k, args.top_p, args.repetition_penalty, args.seed,
+                ):
+                    print(chunk, end="", flush=True)
+                    count += 1
+                print()
+            except KeyboardInterrupt:
+                print("\n(kesildi)")
+            elapsed = time.time() - start
+            logger.info("Streaming tamamlandı: %d token / %.2fs (%.1f tok/s)",
+                        count, elapsed, count / max(elapsed, 1e-9))
+        else:
+            eos = backend.tokenizer.eos_id
+            ids = runtime.generate_ids(
+                backend, prompt_ids, args.max_tokens,
+                temperature=args.temperature, top_k=args.top_k, top_p=args.top_p,
+                repetition_penalty=args.repetition_penalty, eos_token_id=eos,
+                seed=args.seed,
+            )
+            elapsed = time.time() - start
+            logger.info("Üretim tamamlandı: %d token / %.2fs (%.1f tok/s)",
+                        len(ids), elapsed, len(ids) / max(elapsed, 1e-9))
+            # Yalnızca üretilen kısmı göster (prompt zaten ekranda).
+            print(backend.tokenizer.decode(ids), end="")
+            print()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

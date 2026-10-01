@@ -15,3 +15,20 @@
 
 # Log dosyaları
 *.log
+
+# CMake build dizini
+cpp/build/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Egitim ciktilari (model agirligi ve loglar)
+checkpoints/*.pt
+checkpoints/*.bin
+checkpoints/training_metrics.jsonl
+checkpoints/tb_logs/
+
+# Python sanal ortam
+.venv/
+venv/

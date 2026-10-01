@@ -1,174 +1,497 @@
 #include "cofeu/tokenizer.hpp"
 
 #include <cctype>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <queue>
 #include <sstream>
+#include <utility>
 
 namespace cofeu {
 
 namespace {
 
-// UTF-8 karakter uzunluğunu döndürür.
-size_t utf8_len(unsigned char c) {
+// ---------------------------------------------------------------------------
+// Minimal JSON ayrıştırıcı
+//
+// vocab.json içindeki \`}\` karakteri bir token string'inin içinde geçebiliyor
+// (Python ensure_ascii=False ile yazıyor) ve \`"merges"\` gibi anahtarları
+// ham substring aramasıyla bulmak yanlış hedef verebiliyor. Bu yüzden gerçek
+// bir JSON ayrıştırıcı kullanıyoruz.
+// ---------------------------------------------------------------------------
+
+struct JsonValue {
+    enum class Type { Null, Bool, Number, String, Array, Object };
+    Type type = Type::Null;
+    bool boolean = false;
+    double number = 0.0;
+    std::string str;
+    std::vector<JsonValue> arr;
+    std::vector<std::pair<std::string, JsonValue>> obj;
+
+    const JsonValue* find(const std::string& key) const {
+        if (type != Type::Object) return nullptr;
+        for (const auto& kv : obj) {
+            if (kv.first == key) return &kv.second;
+        }
+        return nullptr;
+    }
+};
+
+class JsonParser {
+public:
+    explicit JsonParser(const std::string& s) : s_(s) {}
+
+    bool parse(JsonValue& out) {
+        skip_ws();
+        if (!parse_value(out)) return false;
+        return true;
+    }
+
+    const std::string& error() const { return error_; }
+
+private:
+    const std::string& s_;
+    size_t pos_ = 0;
+    std::string error_;
+
+    bool fail(const std::string& msg) {
+        if (error_.empty()) {
+            error_ = msg + " (offset " + std::to_string(pos_) + ")";
+        }
+        return false;
+    }
+
+    void skip_ws() {
+        while (pos_ < s_.size()) {
+            char c = s_[pos_];
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                pos_++;
+            } else {
+                break;
+            }
+        }
+    }
+
+    bool parse_value(JsonValue& out) {
+        if (pos_ >= s_.size()) return fail("JSON bitti");
+        switch (s_[pos_]) {
+            case '{': return parse_object(out);
+            case '[': return parse_array(out);
+            case '"':
+                out.type = JsonValue::Type::String;
+                return parse_string(out.str);
+            case 't':
+                if (s_.compare(pos_, 4, "true") == 0) {
+                    out.type = JsonValue::Type::Bool;
+                    out.boolean = true;
+                    pos_ += 4;
+                    return true;
+                }
+                return fail("geçersiz literal");
+            case 'f':
+                if (s_.compare(pos_, 5, "false") == 0) {
+                    out.type = JsonValue::Type::Bool;
+                    out.boolean = false;
+                    pos_ += 5;
+                    return true;
+                }
+                return fail("geçersiz literal");
+            case 'n':
+                if (s_.compare(pos_, 4, "null") == 0) {
+                    out.type = JsonValue::Type::Null;
+                    pos_ += 4;
+                    return true;
+                }
+                return fail("geçersiz literal");
+            default: return parse_number(out);
+        }
+    }
+
+    bool parse_number(JsonValue& out) {
+        size_t start = pos_;
+        if (pos_ < s_.size() && (s_[pos_] == '-' || s_[pos_] == '+')) pos_++;
+        bool any = false;
+        while (pos_ < s_.size() && (isdigit(static_cast<unsigned char>(s_[pos_])) || s_[pos_] == '.' ||
+                                   s_[pos_] == 'e' || s_[pos_] == 'E' || s_[pos_] == '-' || s_[pos_] == '+')) {
+            any = true;
+            pos_++;
+        }
+        if (!any) return fail("sayı bekleniyordu");
+        out.type = JsonValue::Type::Number;
+        out.number = std::strtod(s_.substr(start, pos_ - start).c_str(), nullptr);
+        return true;
+    }
+
+    // \uXXXX kaçışını UTF-8'e çevirir (surrogate pair destekli)
+    static void append_utf8(std::string& out, uint32_t cp) {
+        if (cp < 0x80) {
+            out += static_cast<char>(cp);
+        } else if (cp < 0x800) {
+            out += static_cast<char>(0xC0 | (cp >> 6));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            out += static_cast<char>(0xE0 | (cp >> 12));
+            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        } else {
+            out += static_cast<char>(0xF0 | (cp >> 18));
+            out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+    }
+
+    bool parse_hex4(uint32_t& out) {
+        if (pos_ + 4 > s_.size()) return fail("kısa \\u kaçışı");
+        out = 0;
+        for (int i = 0; i < 4; i++) {
+            char c = s_[pos_ + i];
+            out <<= 4;
+            if (c >= '0' && c <= '9') out |= static_cast<uint32_t>(c - '0');
+            else if (c >= 'a' && c <= 'f') out |= static_cast<uint32_t>(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') out |= static_cast<uint32_t>(c - 'A' + 10);
+            else return fail("geçersiz hex");
+        }
+        pos_ += 4;
+        return true;
+    }
+
+    bool parse_string(std::string& out) {
+        if (pos_ >= s_.size() || s_[pos_] != '"') return fail("string bekleniyordu");
+        pos_++;
+        out.clear();
+        while (pos_ < s_.size()) {
+            char c = s_[pos_];
+            if (c == '"') {
+                pos_++;
+                return true;
+            }
+            if (c == '\\') {
+                pos_++;
+                if (pos_ >= s_.size()) return fail("kaçış koptu");
+                char esc = s_[pos_++];
+                switch (esc) {
+                    case 'n': out += '\n'; break;
+                    case 't': out += '\t'; break;
+                    case 'r': out += '\r'; break;
+                    case 'b': out += '\b'; break;
+                    case 'f': out += '\f'; break;
+                    case '/': out += '/'; break;
+                    case '\\': out += '\\'; break;
+                    case '"': out += '"'; break;
+                    case 'u': {
+                        uint32_t cp = 0;
+                        if (!parse_hex4(cp)) return false;
+                        if (cp >= 0xD800 && cp <= 0xDBFF && pos_ + 1 < s_.size() &&
+                            s_[pos_] == '\\' && s_[pos_ + 1] == 'u') {
+                            size_t save = pos_;
+                            pos_ += 2;
+                            uint32_t lo = 0;
+                            if (!parse_hex4(lo)) return false;
+                            if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                            } else {
+                                pos_ = save;  // geçerli değil, ham bırak
+                            }
+                        }
+                        append_utf8(out, cp);
+                        break;
+                    }
+                    default: return fail("bilinmeyen kaçış");
+                }
+                continue;
+            }
+            out += c;
+            pos_++;
+        }
+        return fail("kapanmamış string");
+    }
+
+    bool parse_array(JsonValue& out) {
+        out.type = JsonValue::Type::Array;
+        pos_++;  // '['
+        skip_ws();
+        if (pos_ < s_.size() && s_[pos_] == ']') {
+            pos_++;
+            return true;
+        }
+        while (pos_ < s_.size()) {
+            JsonValue v;
+            if (!parse_value(v)) return false;
+            out.arr.push_back(std::move(v));
+            skip_ws();
+            if (pos_ < s_.size() && s_[pos_] == ',') {
+                pos_++;
+                skip_ws();
+                continue;
+            }
+            if (pos_ < s_.size() && s_[pos_] == ']') {
+                pos_++;
+                return true;
+            }
+            return fail("virgül veya ']' bekleniyordu");
+        }
+        return fail("kapanmamış dizi");
+    }
+
+    bool parse_object(JsonValue& out) {
+        out.type = JsonValue::Type::Object;
+        pos_++;  // '{'
+        skip_ws();
+        if (pos_ < s_.size() && s_[pos_] == '}') {
+            pos_++;
+            return true;
+        }
+        while (pos_ < s_.size()) {
+            skip_ws();
+            std::string key;
+            if (!parse_string(key)) return false;
+            skip_ws();
+            if (pos_ >= s_.size() || s_[pos_] != ':') return fail("':' bekleniyordu");
+            pos_++;
+            skip_ws();  // ':' ile değer arasında boşluk olabilir
+            JsonValue v;
+            if (!parse_value(v)) return false;
+            out.obj.emplace_back(std::move(key), std::move(v));
+            skip_ws();
+            if (pos_ < s_.size() && s_[pos_] == ',') {
+                pos_++;
+                continue;
+            }
+            if (pos_ < s_.size() && s_[pos_] == '}') {
+                pos_++;
+                return true;
+            }
+            return fail("virgül veya '}' bekleniyordu");
+        }
+        return fail("kapanmamış nesne");
+    }
+};
+
+// UTF-8 karakter uzunluğu (baş bayta göre)
+inline size_t utf8_len(unsigned char c) {
     if ((c & 0xE0) == 0xC0) return 2;
     if ((c & 0xF0) == 0xE0) return 3;
     if ((c & 0xF8) == 0xF0) return 4;
     return 1;
 }
 
-// JSON string'i ayrıştırır (kaçış dizileri desteklenir).
-// pos, açılış tırnağından sonraki konumda olmalıdır.
-std::string parse_json_string(const std::string& s, size_t& pos) {
-    std::string out;
-    while (pos < s.size() && s[pos] != '"') {
-        if (s[pos] == '\\' && pos + 1 < s.size()) {
-            pos++;
-            char esc = s[pos];
-            if (esc == 'n') out += '\n';
-            else if (esc == 't') out += '\t';
-            else if (esc == 'r') out += '\r';
-            else if (esc == 'u') {
-                // \uXXXX (UTF-16) — basitlik için ham olarak ekle
-                out += "\\u";
-                for (int i = 0; i < 4 && pos + 1 < s.size(); i++) {
-                    pos++;
-                    out += s[pos];
-                }
-            } else {
-                out += esc;
-            }
-        } else {
-            out += s[pos];
-        }
-        pos++;
-    }
-    return out;
+// İki token id'sini tek bir 64-bit anahtara paketler
+inline uint64_t pair_key(int32_t a, int32_t b) {
+    return (static_cast<uint64_t>(static_cast<uint32_t>(a)) << 32) |
+           static_cast<uint32_t>(b);
 }
 
 } // namespace
 
-bool Tokenizer::load(const std::string& path) {
-    std::ifstream f(path);
-    if (!f.is_open()) return false;
-
-    std::stringstream ss;
-    ss << f.rdbuf();
-    std::string content = ss.str();
-
+bool Tokenizer::load(const std::string& path, std::string* error) {
     merges_.clear();
+    merge_rank_.clear();
     stoi_.clear();
     itos_.clear();
+    is_special_.clear();
+    eos_id_ = -1;
+    unk_id_ = -1;
 
-    // "merges" dizisini bul
-    size_t merges_pos = content.find("\"merges\"");
-    if (merges_pos != std::string::npos) {
-        size_t arr_start = content.find('[', merges_pos);
-        size_t arr_end = content.find(']', arr_start);
-        if (arr_start != std::string::npos && arr_end != std::string::npos) {
-            size_t pos = arr_start + 1;
-            while (pos < arr_end) {
-                size_t q = content.find('"', pos);
-                if (q == std::string::npos || q >= arr_end) break;
-                pos = q + 1;
-                std::string merge = parse_json_string(content, pos);
-                pos++;  // kapanış tırnağı
-                // "a b" -> (a, b)
-                size_t sp = merge.find(' ');
-                if (sp != std::string::npos) {
-                    merges_.emplace_back(merge.substr(0, sp), merge.substr(sp + 1));
-                }
-                pos = content.find(',', pos);
-                if (pos == std::string::npos) break;
-                pos++;
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) {
+        if (error) *error = "dosya açılamadı: " + path;
+        return false;
+    }
+    std::stringstream ss;
+    ss << f.rdbuf();
+    const std::string content = ss.str();
+
+    JsonValue root;
+    JsonParser parser(content);
+    if (!parser.parse(root)) {
+        if (error) *error = "vocab.json ayrıştırılamadı: " + parser.error();
+        return false;
+    }
+
+    // --- vocab ---
+    const JsonValue* vocab = root.find("vocab");
+    if (!vocab || vocab->type != JsonValue::Type::Object || vocab->obj.empty()) {
+        if (error) *error = "\"vocab\" nesnesi bulunamadı veya boş";
+        return false;
+    }
+
+    int max_id = -1;
+    for (const auto& kv : vocab->obj) {
+        if (kv.second.type != JsonValue::Type::Number) continue;
+        int id = static_cast<int>(kv.second.number);
+        if (id < 0) continue;
+        // Yinelenen id varsa son yazan kazanır (Python dict davranışı)
+        if (stoi_.find(kv.first) == stoi_.end()) {
+            stoi_[kv.first] = id;
+            if (id > max_id) max_id = id;
+        }
+    }
+    if (stoi_.empty()) {
+        if (error) *error = "vocab boş";
+        return false;
+    }
+
+    itos_.assign(static_cast<size_t>(max_id) + 1, std::string());
+    for (const auto& kv : stoi_) itos_[static_cast<size_t>(kv.second)] = kv.first;
+
+    // --- special token'lar ---
+    std::vector<std::string> specials;
+    if (const JsonValue* st = root.find("special_tokens"); st && st->type == JsonValue::Type::Array) {
+        for (const auto& v : st->arr) specials.push_back(v.str);
+    }
+    if (specials.empty()) {
+        specials = {"<|bos|>", "<|eos|>", "<|pad|>", "<|unk|>"};
+    }
+    is_special_.assign(itos_.size(), false);
+    for (const auto& s : specials) {
+        auto it = stoi_.find(s);
+        if (it != stoi_.end()) is_special_[static_cast<size_t>(it->second)] = true;
+        if (s == "<|eos|>") eos_id_ = it != stoi_.end() ? it->second : -1;
+        if (s == "<|unk|>") unk_id_ = it != stoi_.end() ? it->second : -1;
+    }
+
+    // --- merges ---
+    // Kabul edilen biçimler:
+    //   v2: [["a", "b"], ...]        (belirsizlik yok — token boşluk içerebilir)
+    //   v1: ["a b", ...]             (ilk boşluktan bölünür)
+    const JsonValue* merges = root.find("merges");
+    if (merges && merges->type == JsonValue::Type::Array) {
+        merges_.reserve(merges->arr.size());
+        for (const auto& m : merges->arr) {
+            std::string a, b;
+            if (m.type == JsonValue::Type::Array) {
+                if (m.arr.size() != 2) continue;
+                a = m.arr[0].str;
+                b = m.arr[1].str;
+            } else if (m.type == JsonValue::Type::String) {
+                size_t sp = m.str.find(' ');
+                if (sp == std::string::npos) continue;
+                a = m.str.substr(0, sp);
+                b = m.str.substr(sp + 1);
+            } else {
+                continue;
             }
+            merges_.emplace_back(a, b);
         }
     }
 
-    // "vocab" nesnesini bul
-    size_t vocab_pos = content.find("\"vocab\"");
-    if (vocab_pos != std::string::npos) {
-        size_t obj_start = content.find('{', vocab_pos);
-        size_t obj_end = content.find('}', obj_start);
-        if (obj_start != std::string::npos && obj_end != std::string::npos) {
-            size_t pos = obj_start + 1;
-            int max_id = -1;
-            while (pos < obj_end) {
-                size_t q = content.find('"', pos);
-                if (q == std::string::npos || q >= obj_end) break;
-                pos = q + 1;
-                std::string key = parse_json_string(content, pos);
-                pos++;  // kapanış tırnağı
-
-                size_t colon = content.find(':', pos);
-                if (colon == std::string::npos || colon >= obj_end) break;
-                size_t val_start = content.find_first_of("0123456789", colon);
-                if (val_start == std::string::npos || val_start >= obj_end) break;
-                size_t val_end = val_start;
-                while (val_end < obj_end && isdigit(content[val_end])) val_end++;
-
-                int id = std::stoi(content.substr(val_start, val_end - val_start));
-                stoi_[key] = id;
-                if (id > max_id) max_id = id;
-
-                pos = content.find(',', val_end);
-                if (pos == std::string::npos) break;
-                pos++;
-            }
-
-            itos_.resize(max_id + 1);
-            for (const auto& [k, v] : stoi_) {
-                itos_[v] = k;
-            }
-        }
+    // Merge tablosunu hazırla: (id_a, id_b) -> rank, rank -> id_(a+b)
+    merge_rank_.reserve(merges_.size() * 2);
+    merged_id_.assign(merges_.size(), -1);
+    for (size_t rank = 0; rank < merges_.size(); rank++) {
+        const auto& [a, b] = merges_[rank];
+        auto ia = stoi_.find(a);
+        auto ib = stoi_.find(b);
+        if (ia == stoi_.end() || ib == stoi_.end()) continue;
+        auto im = stoi_.find(a + b);
+        if (im == stoi_.end()) continue;  // birleşmiş token vocab'ta yok, atla
+        merge_rank_[pair_key(ia->second, ib->second)] = static_cast<int>(rank);
+        merged_id_[rank] = im->second;
     }
 
-    return !stoi_.empty();
+    if (error) error->clear();
+    return true;
 }
 
 std::vector<int> Tokenizer::encode(const std::string& text) const {
-    // Metni UTF-8 karakterlerine böl
-    std::vector<std::string> tokens;
+    std::vector<int> ids;
+    if (text.empty()) return ids;
+
+    const size_t n_chars = text.size();
+    ids.reserve(n_chars);
+
+    // 1) Metni UTF-8 karakterlerine böl ve her karakteri vocab id'sine eşle.
+    //    Vocab'da olmayan karakterler <|unk|> olur (sessizce düşürülmez).
+    const int unknown = unk_id_;
     size_t i = 0;
-    while (i < text.size()) {
+    while (i < n_chars) {
         size_t len = utf8_len(static_cast<unsigned char>(text[i]));
-        tokens.push_back(text.substr(i, len));
+        if (i + len > n_chars) len = 1;
+        auto it = stoi_.find(text.substr(i, len));
+        if (it != stoi_.end()) {
+            ids.push_back(it->second);
+        } else if (unknown >= 0) {
+            ids.push_back(unknown);
+        }
         i += len;
     }
 
-    // BPE birleştirmelerini uygula
-    for (const auto& [a, b] : merges_) {
-        std::vector<std::string> new_tokens;
-        size_t j = 0;
-        while (j < tokens.size()) {
-            if (j + 1 < tokens.size() && tokens[j] == a && tokens[j + 1] == b) {
-                new_tokens.push_back(a + b);
-                j += 2;
-            } else {
-                new_tokens.push_back(tokens[j]);
-                j += 1;
-            }
-        }
-        tokens = std::move(new_tokens);
+    const size_t n = ids.size();
+    if (n < 2 || merge_rank_.empty()) return ids;
+
+    // 2) Canonical BPE: en düşük rank'lı çift, bağlı liste + öncelik kuyruğu.
+    //    python/tokenizer.py::_bpe ile aynı algoritma.
+    std::vector<int> nxt(n);
+    std::vector<int> prev(n);
+    std::vector<char> alive(n, 1);
+    for (size_t t = 0; t < n; t++) {
+        nxt[t] = static_cast<int>(t) + 1;
+        prev[t] = static_cast<int>(t) - 1;
     }
 
-    std::vector<int> ids;
-    ids.reserve(tokens.size());
-    for (const auto& t : tokens) {
-        auto it = stoi_.find(t);
-        if (it != stoi_.end()) {
-            ids.push_back(it->second);
+    typedef std::pair<int, int> HeapItem;  // (rank, pozisyon)
+    std::priority_queue<HeapItem, std::vector<HeapItem>, std::greater<HeapItem>> heap;
+    for (size_t t = 0; t + 1 < n; t++) {
+        auto it = merge_rank_.find(pair_key(ids[t], ids[t + 1]));
+        if (it != merge_rank_.end()) heap.emplace(it->second, static_cast<int>(t));
+    }
+
+    while (!heap.empty()) {
+        const int rank = heap.top().first;
+        const int t = heap.top().second;
+        heap.pop();
+
+        if (!alive[t]) continue;
+        const int j = nxt[t];
+        if (j >= static_cast<int>(n)) continue;
+        auto it = merge_rank_.find(pair_key(ids[t], ids[j]));
+        if (it == merge_rank_.end() || it->second != rank) continue;  // bayat giriş
+
+        const int m = merged_id_[static_cast<size_t>(rank)];
+        if (m < 0) continue;
+
+        ids[t] = m;
+        alive[j] = 0;
+        const int k = nxt[j];
+        nxt[t] = k;
+        if (k < static_cast<int>(n)) {
+            prev[k] = t;
+            auto rk = merge_rank_.find(pair_key(ids[t], ids[k]));
+            if (rk != merge_rank_.end()) heap.emplace(rk->second, t);
+        }
+        if (prev[t] >= 0) {
+            auto rp = merge_rank_.find(pair_key(ids[prev[t]], ids[t]));
+            if (rp != merge_rank_.end()) heap.emplace(rp->second, prev[t]);
         }
     }
-    return ids;
+
+    // 3) Bağlı listeyi sıraya diz. n sentinel (sonlandırıcı) olduğundan
+    //    sınır kontrolü idslere DOKUNMADAN yapılmalı; aksi halde ids[n]
+    //    taşma okuması oluşur.
+    std::vector<int> out;
+    out.reserve(n);
+    for (int t = 0; t >= 0; ) {
+        out.push_back(ids[t]);
+        const int nxt_t = nxt[t];
+        if (nxt_t >= 0 && static_cast<size_t>(nxt_t) >= n) break;  // son geçerli düğüm
+        t = nxt_t;
+    }
+    return out;
 }
 
-std::string Tokenizer::decode(const std::vector<int>& ids) const {
+std::string Tokenizer::decode(const std::vector<int>& ids, bool skip_special_tokens) const {
     std::string out;
+    out.reserve(ids.size() * 4);
+    const int V = static_cast<int>(itos_.size());
     for (int id : ids) {
-        if (id >= 0 && id < static_cast<int>(itos_.size())) {
-            out += itos_[id];
-        }
+        if (id < 0 || id >= V) continue;
+        if (skip_special_tokens && !is_special_.empty() && is_special_[static_cast<size_t>(id)]) continue;
+        out += itos_[static_cast<size_t>(id)];
     }
     return out;
 }
@@ -180,10 +503,14 @@ std::string Tokenizer::decode(const std::vector<int>& ids) const {
 extern "C" {
 
 // Tokenizer oluştur ve vocab.json'dan yükle. Başarılıysa handle döner, değilse nullptr.
-void* cofeu_tokenizer_load(const char* path) {
+void* cofeu_tokenizer_load(const char* path, char* error_out, int error_buf) {
     auto* tok = new cofeu::Tokenizer();
-    if (!tok->load(path)) {
+    std::string err;
+    if (!tok->load(path ? path : "", &err)) {
         delete tok;
+        if (error_out && error_buf > 0) {
+            std::snprintf(error_out, static_cast<size_t>(error_buf), "%s", err.c_str());
+        }
         return nullptr;
     }
     return static_cast<void*>(tok);
@@ -194,28 +521,54 @@ void cofeu_tokenizer_free(void* handle) {
 }
 
 int cofeu_tokenizer_vocab_size(void* handle) {
+    if (!handle) return 0;
     return static_cast<cofeu::Tokenizer*>(handle)->vocabSize();
 }
 
-// Metni encode eder. ids çıktı buffer'ına yazılır, token sayısını döndürür.
+int cofeu_tokenizer_token_count(void* handle) {
+    if (!handle) return 0;
+    return static_cast<cofeu::Tokenizer*>(handle)->tokenCount();
+}
+
+int cofeu_tokenizer_eos_id(void* handle) {
+    if (!handle) return -1;
+    return static_cast<cofeu::Tokenizer*>(handle)->eosId();
+}
+
+// Metni encode eder. ids çıktı buffer'ına yazar, token sayısını döndürür.
 int cofeu_tokenizer_encode(void* handle, const char* text, int* ids, int max_ids) {
-    auto* tok = static_cast<cofeu::Tokenizer*>(handle);
-    auto result = tok->encode(std::string(text));
+    if (!handle || !text || !ids || max_ids <= 0) return 0;
+    auto result = static_cast<cofeu::Tokenizer*>(handle)->encode(std::string(text));
     int n = static_cast<int>(result.size());
-    if (n > max_ids) n = max_ids;
+    if (n > max_ids) n = max_ids;  // buffer taşması; çağıran taraf yeterli yer ayırmalı
     for (int i = 0; i < n; i++) ids[i] = result[i];
     return n;
 }
 
 // Token id'lerini metne çevirir. Çıktıyı out buffer'ına yazar.
-void cofeu_tokenizer_decode(void* handle, const int* ids, int n, char* out, int max_out) {
-    auto* tok = static_cast<cofeu::Tokenizer*>(handle);
-    std::vector<int> vec(ids, ids + n);
-    std::string text = tok->decode(vec);
-    int len = static_cast<int>(text.size());
-    if (len > max_out - 1) len = max_out - 1;
+// Dönüş değeri: yazılan bayt sayısı (null terminatör hariç).
+int cofeu_tokenizer_decode(void* handle, const int* ids, int n, char* out, int max_out) {
+    if (!out || max_out <= 0) return 0;
+    out[0] = '\0';
+    if (!handle || !ids || n <= 0) return 0;
+    std::string text = static_cast<cofeu::Tokenizer*>(handle)->decode(std::vector<int>(ids, ids + n));
+
+    size_t len = text.size();
+    if (len >= static_cast<size_t>(max_out)) {
+        // Birleşik karakterin ortasından kesmemek için UTF-8 sınırına geri al
+        len = static_cast<size_t>(max_out) - 1;
+        while (len > 0 && (static_cast<unsigned char>(text[len]) & 0xC0) == 0x80) len--;
+    }
     std::memcpy(out, text.data(), len);
     out[len] = '\0';
+    return static_cast<int>(len);
+}
+
+// Gerekli decode buffer boyutunu döndürür (null terminatör dahil).
+int cofeu_tokenizer_decode_size(void* handle, const int* ids, int n) {
+    if (!handle || !ids || n <= 0) return 1;
+    return static_cast<int>(static_cast<cofeu::Tokenizer*>(handle)
+                                ->decode(std::vector<int>(ids, ids + n)).size()) + 1;
 }
 
 } // extern "C"

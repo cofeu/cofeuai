@@ -1,1 +1,0 @@
-/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/cofeu_infer.dir/src/main.cpp.o CMakeFiles/cofeu_infer.dir/src/model.cpp.o CMakeFiles/cofeu_infer.dir/src/tokenizer.cpp.o -o cofeu_infer  /usr/lib/gcc/x86_64-linux-gnu/13/libgomp.so /usr/lib/x86_64-linux-gnu/libpthread.a 
