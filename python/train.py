@@ -223,6 +223,8 @@ def main():
     parser.add_argument("--amp", action="store_true", help="Mixed precision (float16) eğitim")
     parser.add_argument("--no-amp", action="store_true", help="AMP'yi devre dışı bırak")
     parser.add_argument("--resume", action="store_true", help="Son checkpoint'tan devam et")
+    parser.add_argument("--corpus", type=str, default=None,
+                        help=f"Corpus dosyası (varsayılan: {DATA_PATH})")
     parser.add_argument("--tb-log-dir", type=str, default=None, help="TensorBoard log dizini")
     parser.add_argument("--eval-iters", type=int, default=20, help="Eval iterasyon sayısı")
 
@@ -255,12 +257,14 @@ def main():
     logger.info("Cihaz: %s", device)
 
     # Veriyi yükle
-    if not DATA_PATH.exists():
-        logger.error("Veri dosyası bulunamadı: %s", DATA_PATH)
-        logger.info("Önce corpus oluşturun: python make_corpus.py")
+    data_path = Path(args.corpus) if args.corpus else DATA_PATH
+    if not data_path.exists():
+        logger.error("Veri dosyası bulunamadı: %s", data_path)
+        logger.info("Önce corpus indirin: python download_dataset.py --max-chars 120000000")
+        logger.info("veya yol verin: python train.py --corpus /path/to/corpus.txt")
         return
 
-    text = DATA_PATH.read_text(encoding="utf-8")
+    text = data_path.read_text(encoding="utf-8")
     logger.info("Veri yüklendi: %s karakter", f"{len(text):,}")
 
     logger.info("BPE tokenizer eğitiliyor...")
