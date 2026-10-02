@@ -75,6 +75,11 @@ def main() -> int:
                         help="PyTorch ile üret (C++ motoru yerine)")
     parser.add_argument("--cuda", action="store_true",
                         help="PyTorch yolunda GPU kullan")
+    parser.add_argument("--chat", action="store_true",
+                        help="SFT modeli: konuşma şablonuna sarar, "
+                             "Asistan kısmını yazdırmaz")
+    parser.add_argument("--ckpt", type=str, default=None,
+                        help="Model yolu (SFT için: checkpoints/sft/cofeu_sft.pt)")
     args = parser.parse_args()
 
     if args.max_tokens < 1:
@@ -83,11 +88,22 @@ def main() -> int:
 
     try:
         backend = runtime.load_backend(
-            prefer_cpp=not args.python, device="cuda" if args.cuda else "cpu"
+            prefer_cpp=not args.python,
+            device="cuda" if args.cuda else "cpu",
+            ckpt_path=Path(args.ckpt) if args.ckpt else None,
         )
     except ModelLoadError as e:
         logger.error("%s", e)
         return 1
+
+    raw_prompt = args.prompt
+    if args.chat:
+        from sft import build_prompt, SYSTEM_PROMPT
+        args.prompt = (
+            f"### Sistem:\n{SYSTEM_PROMPT}\n\n"
+            f"### Kullanıcı:\n{build_prompt(raw_prompt, '')}\n\n"
+            f"### Asistan:\n"
+        )
 
     with backend:
         prompt_ids = backend.tokenizer.encode(args.prompt)

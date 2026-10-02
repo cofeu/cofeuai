@@ -34,3 +34,8 @@ checkpoints/eski_model/
 # Python sanal ortam
 .venv/
 venv/
+
+# Instruction tuning
+.sftenv/
+data/sft/*.parquet
+data/sft/*.jsonl
