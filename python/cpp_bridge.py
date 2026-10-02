@@ -23,6 +23,7 @@ Kullanım:
 from __future__ import annotations
 
 import ctypes
+import json
 from pathlib import Path
 from typing import Callable, Iterator, List, Optional, Sequence
 
@@ -30,6 +31,8 @@ ROOT = Path(__file__).resolve().parent.parent
 LIB_PATH = ROOT / "cpp" / "build" / "libcofeu.so"
 
 _ERROR_BUF = 1024
+# Tembel hesaplanan özel token id'leri için "henüz bilinmiyor" işareti
+_UNSET = -2
 
 # C API geri çağrısı: (token_id, void* user_data)
 _TOKEN_CB = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_void_p)
@@ -146,8 +149,12 @@ class CppTokenizer(_Handle):
     def __init__(self, vocab_path: str | Path):
         super().__init__()
         err = ctypes.create_string_buffer(_ERROR_BUF)
+        self._vocab_path = str(vocab_path)
+        self._bos_id = _UNSET
+        self._pad_id = _UNSET
+        self._unk_id = _UNSET
         self._handle = self._lib.cofeu_tokenizer_load(
-            str(vocab_path).encode(), err, _ERROR_BUF
+            self._vocab_path.encode(), err, _ERROR_BUF
         )
         if not self._handle:
             raise self._fail(f"Tokenizer yüklenemedi ({vocab_path}): {_decode(err)}")
@@ -202,6 +209,45 @@ class CppTokenizer(_Handle):
         if not self._handle:
             raise self._fail("kapatılmış tokenizer")
         return self._lib.cofeu_tokenizer_eos_id(self._handle)
+
+    @property
+    def bos_id(self) -> int:
+        """<|bos|> token id'si.
+
+        C API yalnızca eos_id sunuyor; vocab.json'dan okunur. Üretimde
+        kullanılmaz (prompt BOS'u elle ekler) ama BPETokenizer ile aynı
+        arayüzü korumak için gerekli.
+        """
+        if not self._handle:
+            raise self._fail("kapatılmış tokenizer")
+        if self._bos_id is _UNSET:
+            self._bos_id = self._lookup_special("<|bos|>")
+        return self._bos_id
+
+    @property
+    def pad_id(self) -> int:
+        if not self._handle:
+            raise self._fail("kapatılmış tokenizer")
+        if self._pad_id is _UNSET:
+            self._pad_id = self._lookup_special("<|pad|>")
+        return self._pad_id
+
+    @property
+    def unk_id(self) -> int:
+        if not self._handle:
+            raise self._fail("kapatılmış tokenizer")
+        if self._unk_id is _UNSET:
+            self._unk_id = self._lookup_special("<|unk|>")
+        return self._unk_id
+
+    def _lookup_special(self, token: str) -> int:
+        """vocab.json'dan özel token id'sini bulur; yoksa -1 döner."""
+        try:
+            with open(self._vocab_path, "r", encoding="utf-8") as f:
+                vocab = json.load(f).get("vocab", {})
+            return int(vocab[token])
+        except (OSError, ValueError, KeyError):
+            return -1
 
 
 class CppModel(_Handle):
