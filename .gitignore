@@ -26,8 +26,10 @@ __pycache__/
 # Egitim ciktilari (model agirligi ve loglar)
 checkpoints/*.pt
 checkpoints/*.bin
+checkpoints/vocab.json
 checkpoints/training_metrics.jsonl
 checkpoints/tb_logs/
+checkpoints/eski_model/
 
 # Python sanal ortam
 .venv/
