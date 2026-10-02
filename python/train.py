@@ -340,7 +340,12 @@ def main():
     metrics_path = OUT_DIR / "training_metrics.jsonl"
 
     start_time = time.time()
-    best_val_loss = float("inf")
+    # Resume'da kaydedilmiş en iyi val loss korunur; yoksa inf (ilk eval
+    # her zaman yeni "en iyi" sayılır). Bu sayede checkpoint'ten dönüldüğünde
+    # daha kötü bir model yanlışlıkla cofeu_best.* üzerine yazılmaz.
+    best_val_loss = meta.get("val_loss", float("inf")) if args.resume else float("inf")
+    if args.resume:
+        logger.info("Resume best_val_loss: %.4f", best_val_loss)
 
     logger.info("Eğitim başlıyor: %d iterasyon, lr=%.1e, batch=%d", args.max_iters, args.lr, args.batch_size)
     logger.info("Eval her %d iterasyonda, checkpoint her %d'de", args.eval_interval, args.save_interval)
