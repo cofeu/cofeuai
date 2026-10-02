@@ -206,11 +206,12 @@ def load_backend(
             model = model.to(device)
         elif device != "cpu":
             logger.warning("CUDA yok, CPU kullanılıyor")
+            device = "cpu"
         logger.info(
             "PyTorch modeli yüklendi (%s, %.2fM parametre, cihaz=%s)",
             ckpt_path.name,
             sum(p.numel() for p in model.parameters()) / 1e6,
-            device,
+            next(model.parameters()).device,
         )
         return Backend("torch", tokenizer, model, threading.Lock())
     except Exception as e:
