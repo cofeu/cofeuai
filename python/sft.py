@@ -148,6 +148,8 @@ def main():
     ap.add_argument("--max-iters", type=int, default=0, help="0 = epoch sayısı kadar")
     ap.add_argument("--device", type=str, default="auto")
     ap.add_argument("--log-interval", type=int, default=25)
+    ap.add_argument("--patience", type=int, default=3,
+                    help="Val iyilesmezse kac eval sonra durulur (0 = devam et)")
     ap.add_argument("--eval-interval", type=int, default=200)
     ap.add_argument("--save-interval", type=int, default=400)
     ap.add_argument("--max-samples", type=int, default=0, help="0 = tümü")
@@ -234,10 +236,12 @@ def main():
     step = 0
     t0 = time.time()
     best_val = float("inf")
+    evals_since_improve = 0
+    stopped_early = False
 
     for epoch in range(args.epochs):
         for x, y in make_batches(train_samples, args.batch_size, block_size, rng):
-            if step >= total_steps:
+            if step >= total_steps or stopped_early:
                 break
             for g in opt.param_groups:
                 g["lr"] = get_lr(step)
@@ -262,6 +266,7 @@ def main():
                 logger.info("  >> VAL loss %.4f (ppl %.2f)", vl, math.exp(min(vl, 20)))
                 if vl < best_val:
                     best_val = vl
+                    evals_since_improve = 0
                     torch.save({
                         "model_state": model.state_dict(),
                         "config": cfg,
@@ -270,6 +275,17 @@ def main():
                         "sft": True,
                     }, out_dir / "cofeu_sft.pt")
                     logger.info("  >> kaydedildi: cofeu_sft.pt")
+                else:
+                    # Val arttı -> ezberleme başladı. En iyi model elimizde,
+                    # daha fazla eğitim sadece bozar.
+                    evals_since_improve += 1
+                    logger.info("  >> val arttı (%d/%d), best: %.4f",
+                                evals_since_improve, args.patience, best_val)
+                    if args.patience and evals_since_improve >= args.patience:
+                        logger.info("ERKEN DURDURMA: val %d kez iyilesmedi. "
+                                    "En iyi model kaydedildi.", args.patience)
+                        stopped_early = True
+                        break
             if step % args.save_interval == 0:
                 torch.save({
                     "model_state": model.state_dict(),
@@ -277,7 +293,7 @@ def main():
                     "iteration": step,
                     "sft": True,
                 }, out_dir / "cofeu_sft_latest.pt")
-        if step >= total_steps:
+        if step >= total_steps or stopped_early:
             break
 
     vl = evaluate(model, val_samples, args.batch_size, block_size, device)
