@@ -322,7 +322,7 @@ class CofeuTransformer(nn.Module):
         if not toks:
             # Hiç token üretilmedi (ör. ilk örneklem EOS veya max_new_tokens==0):
             # önceki sürümde torch.cat([]) ValueError fırlatıyordu.
-            return idx.clone()
+            return idx.to(self.head.weight.device)
         return torch.cat(toks, dim=1)
 
     @torch.inference_mode()
@@ -351,6 +351,13 @@ class CofeuTransformer(nn.Module):
             )
         if max_new_tokens < 0:
             raise ValueError("max_new_tokens negatif olamaz")
+
+        # idx çağıran tarafta CPU'da üretiliyor; model CUDA'da olabilir.
+        # Parametre cihazına taşımak, embedding lookup'ın cihazlar arası
+        # karışmasını ("index is on cpu, ... on cuda:0") engeller.
+        param_device = self.head.weight.device
+        if idx.device != param_device:
+            idx = idx.to(param_device)
 
         was_training = self.training
         self.eval()
