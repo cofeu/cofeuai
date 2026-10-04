@@ -36,9 +36,36 @@ CELLS = {
 # NOT: sft.py, veri hazırlığını python/prepare_sft_data.py ile yapıyor.
 """,
     "e02": """\
-# GPU kontrolü: CPU'da eğitim saatlerce sürer, baştan uyaralım.
-!nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || echo "GPU YOK"
-!python -c "import torch; print('torch', torch.__version__, '| cuda', torch.cuda.is_available())"
+# GPU zorunlu: CPU'da 29M model 116K ornek icin saatlerce surer.
+# Kolayca "Torch not compiled with CUDA enabled" hatasi alinir (CPU-only
+# torch kurulu gelebiliyor). O durumda CUDA'li wheel'i kendimiz kuruyoruz.
+# Not: kernel'de zaten yuklenmis torch degismeyecek; egitim ayri surecte
+# basladigi icin yeni kurulum orada gecerli olur, runtime yeniden
+# baslatmaya gerek yok.
+import subprocess, sys
+
+print(subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total",
+                      "--format=csv,noheader"],
+                     capture_output=True, text=True).stdout.strip()
+      or "GPU YOK -> Colab runtime ayarindan GPU sec")
+
+def cuda_ok() -> bool:
+    r = subprocess.run([sys.executable, "-c",
+                        "import torch; print(torch.cuda.is_available())"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() == "True"
+
+print("torch CUDA:", cuda_ok())
+if not cuda_ok():
+    print("CUDA'li torch kuruluyor (cu121)...")
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--upgrade",
+                    "torch", "--index-url",
+                    "https://download.pytorch.org/whl/cu121"], check=True)
+    print("kuruldu, tekrar kontrol:", cuda_ok())
+
+assert cuda_ok(), ("CUDA hala yok. Runtime ayarindan GPU/T4 secip "
+                   "runtime'i yeniden baslat, sonra bu hucreyi tekrar calistir.")
+print("GPU HAZIR")
 """,
     "e03": """\
 import subprocess
@@ -131,6 +158,16 @@ print("\\nVERI HAZIR")
 import subprocess, sys
 from pathlib import Path
 
+# Egitim ayri surecte basliyor; CUDA orada da gecerli olmali.
+# Bu olmadan sessizce CPU'ya dustu ve 'not compiled with CUDA'
+# hatasini 116K ornek saydiktan sonra verdi.
+rc = subprocess.run([sys.executable, "-c",
+    "import torch, sys; sys.exit(0 if torch.cuda.is_available() else 1)"],
+    capture_output=True, text=True)
+assert rc.returncode == 0, (
+    "Bu ortamda CUDA yok. Onceki GPU kontrol hucrelerini calistir; "
+    "sadece bu hucreyi tekrar calistirmak yetmez.")
+
 OUT_DIR = Path('/content/drive/MyDrive/cofeuai/sft_chat')
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 LOG = OUT_DIR / 'train.log'
@@ -176,7 +213,11 @@ print("iteration:", ck.get('iteration'), "| val:", ck.get('val_loss'))
 cfg = ModelConfig(**ck['config'].__dict__)
 m = CofeuTransformer(cfg)
 m.load_state_dict(ck['model_state'])
-m.eval().cuda()
+# Kernel'de torch eski surumde kalabilir (CPU-only olabilir); uretim
+# testi CPU'da da yavas da olsa calisir, sonucu gormek icin yeterli.
+DEV = "cuda" if torch.cuda.is_available() else "cpu"
+print("uretim cihazi:", DEV)
+m.eval().to(DEV)
 tok = BPETokenizer.load('/content/cofeuai/checkpoints/vocab.json')
 
 for q in ("Merhaba, nasılsın?",
@@ -184,7 +225,7 @@ for q in ("Merhaba, nasılsın?",
           "Fotosentez nasıl çalışır?",
           "Bana kısa bir motivasyon cümlesi söyle."):
     p, _ = sft.build_text(q, "", "")
-    x = torch.tensor([tok.encode(p)], dtype=torch.long).cuda()
+    x = torch.tensor([tok.encode(p)], dtype=torch.long).to(DEV)
     torch.manual_seed(42)
     out = m.generate(x, 120, temperature=0.7, top_k=40, eos_token_id=tok.eos_id)
     print(f"\\n>>> {q}\\n{tok.decode(out[0, len(x[0]):].tolist())}")
