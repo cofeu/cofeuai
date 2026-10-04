@@ -39,3 +39,6 @@ venv/
 .sftenv/
 data/sft/*.parquet
 data/sft/*.jsonl
+
+# Kaggle'a yuklenen model kopyalari (353 MB, ASLA commit edilmemeli)
+kaggle_upload/

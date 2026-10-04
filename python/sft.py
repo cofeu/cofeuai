@@ -214,7 +214,19 @@ def main():
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01, betas=(0.9, 0.95))
 
-    steps_per_epoch = math.ceil(len(samples) / args.batch_size)
+    # Split: veri sıralı olabilir (InstrucTurca konu/kaynak bazlı sıralı geliyor),
+    # bu yüzden validation için "son %5" yerine seed'li karıştırma kullanıyoruz.
+    shuffled = list(samples)
+    random.Random(args.seed + 1).shuffle(shuffled)
+
+    n_val = max(len(shuffled) // 20, 1)
+    val_samples = shuffled[:n_val]
+    train_samples = shuffled[n_val:]
+    logger.info("SFT train: %d, val: %d", len(train_samples), len(val_samples))
+
+    # Adım sayısı TRAIN kümesinden hesaplanır; aksi halde loop bir epoch'u
+    # aşıyor ve cosine LR gerçek epoch sonunda sıfıra inmemiş oluyor.
+    steps_per_epoch = math.ceil(len(train_samples) / args.batch_size)
     total_steps = steps_per_epoch * args.epochs
     if args.max_iters:
         total_steps = min(total_steps, args.max_iters)
@@ -225,12 +237,6 @@ def main():
             return args.lr * (it + 1) / max(warmup, 1)
         prog = (it - warmup) / max(total_steps - warmup, 1)
         return args.lr * 0.5 * (1 + math.cos(math.pi * min(prog, 1.0)))
-
-    # Val: son %5
-    n_val = max(len(samples) // 20, 1)
-    val_samples = samples[-n_val:]
-    train_samples = samples[:-n_val]
-    logger.info("SFT train: %d, val: %d", len(train_samples), len(val_samples))
 
     logger.info("Eğitim başlıyor: %d adım (%d epoch x %d adım)", total_steps, args.epochs, steps_per_epoch)
     step = 0
@@ -299,8 +305,17 @@ def main():
     vl = evaluate(model, val_samples, args.batch_size, block_size, device)
     logger.info("SON val loss %.4f (ppl %.2f)", vl, math.exp(min(vl, 20)))
 
-    torch.save({"model_state": model.state_dict(), "config": cfg, "iteration": step,
-                "val_loss": vl, "sft": True}, out_dir / "cofeu_sft.pt")
+    # cofeu_sft.pt daima "en iyi" modeli tutmalı. Son adım daha kötüyse
+    # (early stopping veya val artışı) üzerine yazmak en iyi modeli bozar.
+    if vl < best_val:
+        best_val = vl
+        torch.save({"model_state": model.state_dict(), "config": cfg, "iteration": step,
+                    "val_loss": vl, "sft": True}, out_dir / "cofeu_sft.pt")
+        logger.info("Son model en iyisi -> cofeu_sft.pt")
+    else:
+        logger.info("Son model daha kötü (%.4f >= best %.4f) -> en iyi checkpoint korunuyor",
+                    vl, best_val)
+
     logger.info("Bitti -> %s", out_dir / "cofeu_sft.pt")
 
 
