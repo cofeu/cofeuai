@@ -11,6 +11,7 @@ otomatik esit kalir. Dosyalardan birini degistirince:
     python3 data/sft/build_chat_notebook.py
 sonra notebook'u commit'le.
 """
+import ast
 import base64
 import json
 import pathlib
@@ -34,13 +35,11 @@ CELLS = {
 #     + tascib/turkish-instruction (kısa soru/cevap, 324K)
 # NOT: sft.py, veri hazırlığını python/prepare_sft_data.py ile yapıyor.
 """,
-
     "e02": """\
 # GPU kontrolü: CPU'da eğitim saatlerce sürer, baştan uyaralım.
 !nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || echo "GPU YOK"
 !python -c "import torch; print('torch', torch.__version__, '| cuda', torch.cuda.is_available())"
 """,
-
     "e03": """\
 import subprocess
 r = subprocess.run(["git", "clone", "--depth", "1",
@@ -52,13 +51,11 @@ if r.returncode != 0:
 print(subprocess.run(["git", "-C", "/content/cofeuai", "log", "--oneline", "-1"],
                      capture_output=True, text=True).stdout)
 """,
-
     "e04": """\
 from google.colab import drive
 drive.mount('/content/drive')
 print("Drive baglandi")
 """,
-
     "e05": """\
 import os, shutil, glob, zipfile
 from pathlib import Path
@@ -91,10 +88,10 @@ for n in CANDIDATES:
     print(f"  {n:18s} {'BULUNDU: ' + hits[0] if hits else 'yok'}")
 if src is None:
     raise FileNotFoundError(
-        "Drive'da model checkpoint'i yok. Yukleyin:\n"
-        "  ~/Desktop/CofeuAI/checkpoints/cofeu.pt\n"
+        "Drive'da model checkpoint'i yok. Yukleyin:\\n"
+        "  ~/Desktop/CofeuAI/checkpoints/cofeu.pt\\n"
         "  -> /content/drive/MyDrive/cofeuai/checkpoints/cofeu.pt")
-print(f"secilen: {src}\n")
+print(f"secilen: {src}\\n")
 shutil.copy(src, REPO / 'checkpoints' / 'cofeu.pt')
 print(f"cofeu.pt ({os.path.getsize(REPO/'checkpoints'/'cofeu.pt')/1e6:.1f} MB) hazir")
 
@@ -104,7 +101,6 @@ if vsrc is None:
 shutil.copy(vsrc, REPO / 'checkpoints' / 'vocab.json')
 print(f"vocab.json <- {vsrc}")
 """,
-
     "e06": """\
 # Veri hazirligi. Script repo ile birlikte gelir; internet gerekir
 # (ShareGPT 31 MB + tascib 390 MB). Onceden /content/sft_raw'a indirilmis
@@ -121,13 +117,12 @@ cmd = [
     "--max-sharegpt", "60000",
     "--max-tascib", "60000",
 ]
-print(" ".join(cmd), "\n")
+print(" ".join(cmd), "\\n")
 r = subprocess.run(cmd, cwd="/content/cofeuai")
 if r.returncode != 0:
     raise RuntimeError(f"veri hazirligi basarisiz, exit={r.returncode}")
-print("\nVERI HAZIR")
+print("\\nVERI HAZIR")
 """,
-
     "e07": """\
 # lr 3e-5, 1 epoch. Onceki denemeler 5e-5'te ezberlemeye yol acti.
 # Ciktiyi Dogrudan Drive'a yaziyoruz; oturum duserse checkpoint kalir.
@@ -150,11 +145,11 @@ cmd = [
     "--eval-interval", "200", "--save-interval", "500",
     "--log-interval", "50", "--device", "cuda",
 ]
-print("calistiriliyor:", " ".join(cmd), "\n")
-print(f"log -> {LOG}\n")
+print("calistiriliyor:", " ".join(cmd), "\\n")
+print(f"log -> {LOG}\\n")
 
 with open(LOG, "w", encoding="utf-8", buffering=1) as logf:
-    logf.write(f"$ {' '.join(cmd)}\n\n")
+    logf.write(f"$ {' '.join(cmd)}\\n\\n")
     p = subprocess.Popen(cmd, cwd="/content/cofeuai",
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          text=True, bufsize=1)
@@ -165,9 +160,8 @@ with open(LOG, "w", encoding="utf-8", buffering=1) as logf:
 
 if rc != 0:
     raise RuntimeError(f"egitim basarisiz, exit={rc}. Log: {LOG}")
-print(f"\nEGITIM TAMAM | log: {LOG}")
+print(f"\\nEGITIM TAMAM | log: {LOG}")
 """,
-
     "e08": """\
 import sys, torch
 sys.path.insert(0, '/content/cofeuai/python')
@@ -193,9 +187,8 @@ for q in ("Merhaba, nasılsın?",
     x = torch.tensor([tok.encode(p)], dtype=torch.long).cuda()
     torch.manual_seed(42)
     out = m.generate(x, 120, temperature=0.7, top_k=40, eos_token_id=tok.eos_id)
-    print(f"\n>>> {q}\n{tok.decode(out[0, len(x[0]):].tolist())}")
+    print(f"\\n>>> {q}\\n{tok.decode(out[0, len(x[0]):].tolist())}")
 """,
-
     "e09": """\
 import subprocess
 from pathlib import Path
@@ -203,14 +196,13 @@ OUT_DIR = Path('/content/drive/MyDrive/cofeuai/sft_chat')
 
 print(subprocess.run(["bash", "-c", f"tail -25 {OUT_DIR}/train.log"],
                      capture_output=True, text=True).stdout)
-print("\n--- dosyalar ---")
+print("\\n--- dosyalar ---")
 print(subprocess.run(["bash", "-c", f"ls -la {OUT_DIR}"],
                      capture_output=True, text=True).stdout)
 
 subprocess.run(["zip", "-j", "/content/cofeu_sft_chat.zip", str(OUT_DIR / 'cofeu_sft.pt')])
 print("zip: /content/cofeu_sft_chat.zip  (Colab Files sekmesinden indir)")
 """,
-
 }
 
 # Hucre sirasi: e03 (klon) sonrasi gomulu dosyalar, cunku /content/cofeuai
@@ -255,13 +247,43 @@ def to_source(text: str) -> list:
     return [ln + "\n" for ln in lines[:-1]] + [lines[-1]]
 
 
+def python_only(src: str) -> str:
+    """Colab sihirbazlarini (! / %) at, geriye gercek Python kalir.
+
+    Magikler her zaman satirin BASINDA olmalidir; bu yuzden soldaki bosluk
+    olsa bile sihirbaz sayilir (Python'da girintili ifade olur).
+    """
+    return "\n".join(l for l in src.split("\n")
+                     if not l.startswith(("!", "%")))
+
+
+def validate(srcs):
+    """Bozuk hucre uretmeden once hepsini sozdiziminden gecir.
+
+    Gerekce: bir kez `\\n` kacisi unutulunca uc hucre sessizce bozuldu ve
+    Colab'da SyntaxError olarak patladi. Uretici artik bunu kendisi yakalar.
+    """
+    for i, s in enumerate(srcs):
+        assert isinstance(s, str) and s.strip(), f"hucre {i} bos"
+        code = python_only(s)
+        code = "\n".join(l for l in code.split("\n")
+                         if l.strip() and not l.lstrip().startswith("#"))
+        if not code:
+            continue  # saf yorum veya saf shell
+        try:
+            ast.parse(code)
+        except SyntaxError as e:
+            raise SystemExit(
+                f"Hucre {i} bozuk Python ({e}).\n"
+                f"Notebook YAZILMADI. Hucreyi duzeltip tekrar calistir."
+            ) from e
+
+
 def build():
     srcs = list(SEQUENCE)
     for slot, (rel, dest) in zip((3, 4), EMBEDDED):
         srcs[slot] = embed_cell(rel, dest)
-
-    for i, s in enumerate(srcs):
-        assert isinstance(s, str) and s.strip(), f"hucre {i} bos"
+    validate(srcs)
 
     cells = [{"cell_type": "code", "execution_count": None, "metadata": {},
               "outputs": [], "source": to_source(s)} for s in srcs]
