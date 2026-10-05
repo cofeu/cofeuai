@@ -37,16 +37,32 @@ LEN_BANDS = ((0, 80, "kisa"), (80, 300, "orta"),
 
 # Veri icermesi gereken konu tipleri. Elle uretilen veride en sik
 # eksik olan sey budur: insanlar 3000 selamlama yazip gerisini unutur.
+#
+# SIRASI ONEMLI: ilk eslesen kategori kazanir. Ozel kaliplar once
+# gelir, kisa_qa en sonda artik kalip olarak durur. Aksi halde
+# kisa_qa (r"\?$") butun sorulara eslesip gercek konu tiplerini
+# gizler ve kapsama raporu anlamsiz hale gelir.
 COVERAGE = {
-    "selamlama":   r"^(merhaba|selam|iyi günler|iyi akşamlar|nasılsın|nasılsiniz|ne haber)",
-    "kisa_qa":     r"\?$",
-    "bilgi":       r"(nedir|ne demek|tarih|kim(ler)?|kaç|nerede|hangi)",
-    "aciklama":    r"(açıkla|açikla|anlat|neden|nasıl çalışır|nasil calisir|fark)",
-    "adim_adim":   r"(adım|adim|nasıl yaparım|nasil yaparim|reçete|tarif|kurulum)",
-    "sohbet":      r"\b(emin|belki|tabii|aslında|aslinda|sen de|sen de)\b",
-    "reddetme":    r"(bilmiyorum|bilemiyorum|emin değilim|emin degilim|yanlış|yanlis)",
-    "yok":         r"(merhaba|nasılsın|teşekkür|teşekkür|evet|tamam)",
+    "selamlama":  r"^(merhaba|selam|selamlar|günaydın|gunaydin|iyi günler|iyi akşamlar|"
+                  r"nasılsın|nasılsiniz|ne haber|iyi haftalar)",
+    "reddetme":   r"(bilmiyorum|bilemiyorum|emin değilim|emin degilim|veremem|"
+                  r"değerlendiremem|hesaplayamam|öneremem|öneremez|tavsiye veremem|"
+                  r"güncel veri yok|emin olamadım)",
+    "adim_adim":  r"(nasıl (yapılır|yaparım|yapabilirim|olur|hazırlanır|pişirilir|kurulur|"
+                  r"kullanılır|alınır|ayarlanır|çıkarılır|kaçırılır)|"
+                  r"nasil (yapilir|yaparim|yapabilirim|olur|hazirlanir|pisirilir|kurulur|"
+                  r"kullanilir|alinir|ayarlanir|cikarilir|kacirilir)|adım adım|adim adim|"
+                  r"reçete|tarif|ipuçları|kurulum|montaj|ne yapmalıyım|ne yapmam lazım)",
+    "sohbet":     r"(hissediyorum|keyfim|üzgün|mutlu|yorgun|bezgin|sıkıldım|moralim|stres|"
+                  r"stresli|yapamıyorum|başaramıyorum|özgüven|yalnız|yalnızım|kaygı|"
+                  r"moralim bozuk|içimden|canım)",
+    "aciklama":   r"(açıkla|açikla|anlat|neden|nasıl çalışır|nasil calisir|fark|"
+                  r"nedir|ne demek|ne işe yarar|niye)",
+    "bilgi":      r"(tarih|tarihi|kim(ler)?|kaç|nerede|hangi|ne kadar|ne zaman|kaçta)",
 }
+
+# Artik kalip: hicbiri eslesmediyse ve ilk kullanici turu soru mi?
+KISA_QA = r"\?$"
 
 
 def parse_record(rec: dict):
@@ -169,11 +185,19 @@ def main() -> int:
             if bad:
                 continue
 
-            # konu tipi kapsami (sadece ilk turden)
+            # konu tipi kapsami. Yalnizca ilk KULLANICI turu yeterli
+            # degildir: "bilmiyorum" gibi reddetme isaretleri ASISTAN
+            # cevabinda yasar, o yuzden ilk cevap da taranir.
             ilk_u = turns[0][0]
+            ilk_a = turns[0][1]
+            konu = f"{ilk_u} {ilk_a}"
             for ad, pat in COVERAGE.items():
-                if re.search(pat, ilk_u, re.I):
+                if re.search(pat, konu, re.I):
                     coverage[ad] += 1
+                    break
+            else:
+                if re.search(KISA_QA, ilk_u):
+                    coverage["kisa_qa"] += 1
 
             for _, a in turns:
                 key = re.sub(r"\s+", " ", a.strip().lower())[:120]
@@ -183,8 +207,12 @@ def main() -> int:
                     break
                 seen_keys.add(key)
                 lens.append(len(a.strip()))
+                # Dejenere tekrar BIR HATADIR, uyari degil. Ilk SFT
+                # kosusunda model tam da bu yuzden (tekrar dongusu)
+                # bozuk metin uretiyordu; boyle veri egitime sokulmaz.
                 if degenerate(a):
-                    uyari["dejenere tekrar"] += 1
+                    hata["dejenere tekrar"] += 1
+                    bad = True
             if bad:
                 continue
 
@@ -213,8 +241,9 @@ def main() -> int:
         from statistics import median
         print(f"  medyan {median(lens):.0f} karakter")
 
-    print("\nkonu tipi kapsami (ilk tur uzerinden):")
-    for ad in COVERAGE:
+    print("\nkonu tipi kapsami (ilk tur + ilk cevap uzerinden):")
+    sirali = list(COVERAGE.items()) + [("kisa_qa", KISA_QA)]
+    for ad, _ in sirali:
         k = coverage[ad]
         pct = 100 * k / n_rec if n_rec else 0
         print(f"  {ad:12s} {k:6d}  %{pct:5.1f} "
